@@ -1,7 +1,7 @@
 from datetime import date, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
-from pydantic import BaseModel, EmailStr, validator
+from pydantic import BaseModel, EmailStr, validator, Field
 from enum import Enum
 import uuid
 
@@ -24,7 +24,7 @@ class UserBase(BaseModel):
 
 
 class UserCreate(UserBase):
-    password: str
+    password: str = Field(..., min_length=8)
     confirm_password: str
 
     @validator("confirm_password")
@@ -33,32 +33,49 @@ class UserCreate(UserBase):
             raise ValueError("Passwords do not match")
         return v
     
+    @validator("password")
+    def password_strength(cls, v):
+        """Validate password strength."""
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters long")
+        
+        has_upper = any(c.isupper() for c in v)
+        has_lower = any(c.islower() for c in v)
+        has_digit = any(c.isdigit() for c in v)
+        has_special = any(not c.isalnum() for c in v)
+        
+        if not (has_upper and has_lower and has_digit and has_special):
+            raise ValueError(
+                "Password must contain at least one uppercase letter, "
+                "one lowercase letter, one digit, and one special character"
+            )
+        
+        return v
+    
     @validator("first_name", "last_name")
     def validate_names(cls, v):
+        """Validate that names contain only alphabetic characters."""
         if not v.isalpha():
-            raise ValueError("Names must contain only alphabetic characters")
+            raise ValueError("Name must contain only alphabetic characters")
         return v.title()
     
     @validator("mobile")
     def validate_mobile(cls, v):
-        # Validate Bangladeshi phone number format: +880XXXXXXXXXX
-        if not v.startswith("+880") or len(v) != 14 or not v[4:].isdigit():
+        """Validate Bangladeshi phone number format."""
+        import re
+        pattern = r"^\+880\d{10}$"
+        if not re.match(pattern, v):
             raise ValueError("Mobile must be in Bangladeshi format (+880XXXXXXXXXX)")
         return v
     
     @validator("date_of_birth")
     def validate_age(cls, v):
+        """Validate that user is at least 13 years old."""
         from datetime import datetime
         today = datetime.now().date()
         age = today.year - v.year - ((today.month, today.day) < (v.month, v.day))
         if age < 13:
             raise ValueError("User must be at least 13 years old")
-        return v
-    
-    @validator("password")
-    def validate_password(cls, v):
-        if len(v) < 8:
-            raise ValueError("Password must be at least 8 characters long")
         return v
 
 
@@ -128,9 +145,9 @@ def run_tests():
         user_data = {
             "first_name": "Test",
             "last_name": "User",
-            "date_of_birth": str(date.today() - timedelta(days=365 * 25)),
+            "date_of_birth": str(date.today() - timedelta(days=365 * 25)),  # 25 years ago
             "gender": Gender.MALE.value,
-            "email": f"test.user.{uuid.uuid4()}@example.com",
+            "email": f"test.user.{uuid.uuid4()}@example.com",  # Unique email
             "mobile": "+8801712345678",
             "password": "StrongPassword123!",
             "confirm_password": "StrongPassword123!"
@@ -225,6 +242,164 @@ def run_tests():
     except Exception as e:
         print(f"Test FAILED: {str(e)}")
         failed_tests.append("Test 3: Duplicate Email")
+    
+    # Test 4: Invalid Email Format
+    test_count += 1
+    print("\n========== Test 4: Invalid Email Format ==========")
+    try:
+        user_data = {
+            "first_name": "Test",
+            "last_name": "User",
+            "date_of_birth": str(date.today() - timedelta(days=365 * 25)),
+            "gender": Gender.MALE.value,
+            "email": "invalid-email-format",  # Invalid email format
+            "mobile": "+8801712345678",
+            "password": "StrongPassword123!",
+            "confirm_password": "StrongPassword123!"
+        }
+        
+        response = client.post("/api/v1/auth/register", json=user_data)
+        print(f"Status code: {response.status_code}")
+        print(f"Response: {response.json()}")
+        
+        assert response.status_code == 422
+        data = response.json()
+        
+        assert "detail" in data
+        assert any("email" in str(error["loc"]) for error in data["detail"])
+        
+        print("Test PASSED")
+        passed_count += 1
+    except Exception as e:
+        print(f"Test FAILED: {str(e)}")
+        failed_tests.append("Test 4: Invalid Email Format")
+    
+    # Test 5: Underage User
+    test_count += 1
+    print("\n========== Test 5: Underage User ==========")
+    try:
+        user_data = {
+            "first_name": "Test",
+            "last_name": "User",
+            "date_of_birth": str(date.today() - timedelta(days=365 * 12)),  # 12 years old
+            "gender": Gender.MALE.value,
+            "email": f"test.user.{uuid.uuid4()}@example.com",
+            "mobile": "+8801712345678",
+            "password": "StrongPassword123!",
+            "confirm_password": "StrongPassword123!"
+        }
+        
+        response = client.post("/api/v1/auth/register", json=user_data)
+        print(f"Status code: {response.status_code}")
+        print(f"Response: {response.json()}")
+        
+        assert response.status_code == 422
+        data = response.json()
+        
+        assert "detail" in data
+        assert any("date_of_birth" in str(error["loc"]) for error in data["detail"])
+        assert any("User must be at least 13 years old" in str(error["msg"]) for error in data["detail"])
+        
+        print("Test PASSED")
+        passed_count += 1
+    except Exception as e:
+        print(f"Test FAILED: {str(e)}")
+        failed_tests.append("Test 5: Underage User")
+    
+    # Test 6: Invalid Mobile Format
+    test_count += 1
+    print("\n========== Test 6: Invalid Mobile Format ==========")
+    try:
+        user_data = {
+            "first_name": "Test",
+            "last_name": "User",
+            "date_of_birth": str(date.today() - timedelta(days=365 * 25)),
+            "gender": Gender.MALE.value,
+            "email": f"test.user.{uuid.uuid4()}@example.com",
+            "mobile": "1234567890",  # Invalid Bangladeshi format
+            "password": "StrongPassword123!",
+            "confirm_password": "StrongPassword123!"
+        }
+        
+        response = client.post("/api/v1/auth/register", json=user_data)
+        print(f"Status code: {response.status_code}")
+        print(f"Response: {response.json()}")
+        
+        assert response.status_code == 422
+        data = response.json()
+        
+        assert "detail" in data
+        assert any("mobile" in str(error["loc"]) for error in data["detail"])
+        assert any("Bangladeshi format" in str(error["msg"]) for error in data["detail"])
+        
+        print("Test PASSED")
+        passed_count += 1
+    except Exception as e:
+        print(f"Test FAILED: {str(e)}")
+        failed_tests.append("Test 6: Invalid Mobile Format")
+    
+    # Test 7: Weak Password
+    test_count += 1
+    print("\n========== Test 7: Weak Password ==========")
+    try:
+        user_data = {
+            "first_name": "Test",
+            "last_name": "User",
+            "date_of_birth": str(date.today() - timedelta(days=365 * 25)),
+            "gender": Gender.MALE.value,
+            "email": f"test.user.{uuid.uuid4()}@example.com",
+            "mobile": "+8801712345678",
+            "password": "password",  # Weak password
+            "confirm_password": "password"
+        }
+        
+        response = client.post("/api/v1/auth/register", json=user_data)
+        print(f"Status code: {response.status_code}")
+        print(f"Response: {response.json()}")
+        
+        assert response.status_code == 422
+        data = response.json()
+        
+        assert "detail" in data
+        assert any("password" in str(error["loc"]) for error in data["detail"])
+        
+        print("Test PASSED")
+        passed_count += 1
+    except Exception as e:
+        print(f"Test FAILED: {str(e)}")
+        failed_tests.append("Test 7: Weak Password")
+    
+    # Test 8: Invalid Name Format
+    test_count += 1
+    print("\n========== Test 8: Invalid Name Format ==========")
+    try:
+        user_data = {
+            "first_name": "Test123",  # Name with numbers
+            "last_name": "User",
+            "date_of_birth": str(date.today() - timedelta(days=365 * 25)),
+            "gender": Gender.MALE.value,
+            "email": f"test.user.{uuid.uuid4()}@example.com",
+            "mobile": "+8801712345678",
+            "password": "StrongPassword123!",
+            "confirm_password": "StrongPassword123!"
+        }
+        
+        response = client.post("/api/v1/auth/register", json=user_data)
+        print(f"Status code: {response.status_code}")
+        print(f"Response: {response.json()}")
+        
+        assert response.status_code == 422
+        data = response.json()
+        
+        assert "detail" in data
+        assert any("first_name" in str(error["loc"]) for error in data["detail"])
+        assert any("alphabetic characters" in str(error["msg"]) for error in data["detail"])
+        
+        print("Test PASSED")
+        passed_count += 1
+    except Exception as e:
+        print(f"Test FAILED: {str(e)}")
+        failed_tests.append("Test 8: Invalid Name Format")
     
     # Print summary
     print("\n========== Test Summary ==========")
