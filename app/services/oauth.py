@@ -2,12 +2,14 @@ import json
 import secrets
 from typing import Dict, Optional
 from urllib.parse import urlencode
+from datetime import datetime, timedelta
 
 import httpx
 from fastapi import HTTPException, status
 
 from app.core.config import settings
-from app.schemas.oauth import OAuthProvider, OAuthUserInfo
+from app.core.enums import OAuthProvider
+from app.schemas.oauth import OAuthUserInfo
 
 
 # OAuth configuration for providers
@@ -28,6 +30,30 @@ OAUTH_CONFIGS = {
         "userinfo_url": "https://graph.facebook.com/v12.0/me",
         "scope": "email public_profile",
         "userinfo_fields": "id,first_name,last_name,email,picture",
+    },
+    OAuthProvider.GITHUB: {
+        "client_id": settings.GITHUB_CLIENT_ID,
+        "client_secret": settings.GITHUB_CLIENT_SECRET,
+        "auth_url": "https://github.com/login/oauth/authorize",
+        "token_url": "https://github.com/login/oauth/access_token",
+        "userinfo_url": "https://api.github.com/user",
+        "scope": "user:email",
+    },
+    OAuthProvider.LINKEDIN: {
+        "client_id": settings.LINKEDIN_CLIENT_ID,
+        "client_secret": settings.LINKEDIN_CLIENT_SECRET,
+        "auth_url": "https://www.linkedin.com/oauth/v2/authorization",
+        "token_url": "https://www.linkedin.com/oauth/v2/accessToken",
+        "userinfo_url": "https://api.linkedin.com/v2/me",
+        "scope": "r_liteprofile r_emailaddress",
+    },
+    OAuthProvider.TWITTER: {
+        "client_id": settings.TWITTER_CLIENT_ID,
+        "client_secret": settings.TWITTER_CLIENT_SECRET,
+        "auth_url": "https://twitter.com/i/oauth2/authorize",
+        "token_url": "https://api.twitter.com/2/oauth2/token",
+        "userinfo_url": "https://api.twitter.com/2/users/me",
+        "scope": "tweet.read users.read",
     },
 }
 
@@ -101,7 +127,19 @@ async def exchange_code_for_token(provider: OAuthProvider, code: str, redirect_u
                 detail=f"Failed to exchange authorization code for token: {response.text}",
             )
         
-        return response.json()
+        token_data = response.json()
+        
+        # Ensure all required fields are present
+        if not all(key in token_data for key in ["access_token", "expires_in"]):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid token response from provider",
+            )
+        
+        # Add computed fields
+        token_data["expires_at"] = datetime.utcnow() + timedelta(seconds=token_data["expires_in"])
+        
+        return token_data
 
 
 async def get_user_info(provider: OAuthProvider, token_data: Dict) -> OAuthUserInfo:
@@ -128,6 +166,8 @@ async def get_user_info(provider: OAuthProvider, token_data: Dict) -> OAuthUserI
     # Add provider-specific parameters
     if provider == OAuthProvider.FACEBOOK:
         params["fields"] = config["userinfo_fields"]
+    elif provider == OAuthProvider.GITHUB:
+        headers["Accept"] = "application/vnd.github.v3+json"
     
     # Make the user info request
     async with httpx.AsyncClient() as client:
@@ -147,9 +187,11 @@ async def get_user_info(provider: OAuthProvider, token_data: Dict) -> OAuthUserI
             provider=provider,
             provider_user_id=user_data["sub"],
             email=user_data["email"],
-            first_name=user_data.get("given_name", ""),
-            last_name=user_data.get("family_name", ""),
+            first_name=user_data.get("given_name"),
+            last_name=user_data.get("family_name"),
             picture_url=user_data.get("picture"),
+            gender=user_data.get("gender"),
+            date_of_birth=user_data.get("birthdate"),
             raw_data=user_data,
         )
     elif provider == OAuthProvider.FACEBOOK:
@@ -157,9 +199,63 @@ async def get_user_info(provider: OAuthProvider, token_data: Dict) -> OAuthUserI
             provider=provider,
             provider_user_id=user_data["id"],
             email=user_data.get("email", ""),  # Facebook might not return email if not public
-            first_name=user_data.get("first_name", ""),
-            last_name=user_data.get("last_name", ""),
+            first_name=user_data.get("first_name"),
+            last_name=user_data.get("last_name"),
             picture_url=user_data.get("picture", {}).get("data", {}).get("url") if "picture" in user_data else None,
+            gender=user_data.get("gender"),
+            date_of_birth=user_data.get("birthday"),  # Facebook returns birthday in MM/DD/YYYY format
+            raw_data=user_data,
+        )
+    elif provider == OAuthProvider.GITHUB:
+        # Get email from GitHub's email endpoint
+        async with httpx.AsyncClient() as client:
+            email_response = await client.get(
+                "https://api.github.com/user/emails",
+                headers=headers
+            )
+            if email_response.status_code == 200:
+                emails = email_response.json()
+                primary_email = next((email["email"] for email in emails if email["primary"]), emails[0]["email"])
+            else:
+                primary_email = user_data.get("email", "")
+        
+        # Split name into first and last name
+        full_name = user_data.get("name", "").split(" ", 1)
+        first_name = full_name[0] if full_name else None
+        last_name = full_name[1] if len(full_name) > 1 else None
+        
+        return OAuthUserInfo(
+            provider=provider,
+            provider_user_id=str(user_data["id"]),
+            email=primary_email,
+            first_name=first_name,
+            last_name=last_name,
+            picture_url=user_data.get("avatar_url"),
+            raw_data=user_data,
+        )
+    elif provider == OAuthProvider.LINKEDIN:
+        return OAuthUserInfo(
+            provider=provider,
+            provider_user_id=user_data["id"],
+            email=user_data.get("emailAddress", ""),
+            first_name=user_data.get("localizedFirstName"),
+            last_name=user_data.get("localizedLastName"),
+            picture_url=user_data.get("profilePicture", {}).get("displayImage"),
+            raw_data=user_data,
+        )
+    elif provider == OAuthProvider.TWITTER:
+        # Split name into first and last name
+        full_name = user_data.get("data", {}).get("name", "").split(" ", 1)
+        first_name = full_name[0] if full_name else None
+        last_name = full_name[1] if len(full_name) > 1 else None
+        
+        return OAuthUserInfo(
+            provider=provider,
+            provider_user_id=user_data["data"]["id"],
+            email=user_data.get("data", {}).get("email", ""),
+            first_name=first_name,
+            last_name=last_name,
+            picture_url=user_data.get("data", {}).get("profile_image_url"),
             raw_data=user_data,
         )
     

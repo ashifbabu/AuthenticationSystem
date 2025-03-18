@@ -12,7 +12,7 @@ from app.core.security import get_password_hash
 
 def create_verification_token(
     db: Session,
-    user_id: UUID,
+    user_id: str,
     token: str,
     token_type: TokenType,
     expires_delta: timedelta,
@@ -20,13 +20,12 @@ def create_verification_token(
     """Create a verification token."""
     expires_at = datetime.utcnow() + expires_delta
     
-    db_obj = Token(
+    db_obj = VerificationToken(
         user_id=user_id,
-        token_hash=token,  # We're not hashing verification tokens in this implementation
-        type=token_type,
+        token=token,  # We're not hashing verification tokens in this implementation
+        token_type=token_type,
         expires_at=expires_at,
         created_at=datetime.utcnow(),
-        is_used=False,
     )
     
     db.add(db_obj)
@@ -38,20 +37,19 @@ def create_verification_token(
 
 def create_access_token(
     db: Session,
-    user_id: UUID,
+    user_id: str,
     token: str,
     expires_delta: timedelta,
 ) -> Token:
     """Create an access token entry."""
     expires_at = datetime.utcnow() + expires_delta
     
-    db_obj = Token(
+    db_obj = AccessToken(
         user_id=user_id,
-        token_hash=token,  # We're not hashing JWT tokens as they're self-contained
-        type=TokenType.ACCESS,
+        token=token,  # We're not hashing JWT tokens as they're self-contained
+        token_type=TokenType.ACCESS,
         expires_at=expires_at,
         created_at=datetime.utcnow(),
-        is_used=False,
     )
     
     db.add(db_obj)
@@ -63,20 +61,19 @@ def create_access_token(
 
 def create_refresh_token(
     db: Session,
-    user_id: UUID,
+    user_id: str,
     token: str,
     expires_delta: timedelta,
 ) -> Token:
     """Create a refresh token entry."""
     expires_at = datetime.utcnow() + expires_delta
     
-    db_obj = Token(
+    db_obj = RefreshToken(
         user_id=user_id,
-        token_hash=token,  # We're not hashing JWT tokens as they're self-contained
-        type=TokenType.REFRESH,
+        token=token,  # We're not hashing JWT tokens as they're self-contained
+        token_type=TokenType.REFRESH,
         expires_at=expires_at,
         created_at=datetime.utcnow(),
-        is_used=False,
     )
     
     db.add(db_obj)
@@ -93,9 +90,9 @@ def get_token(
 ) -> Optional[Token]:
     """Get a token by its value and type."""
     return db.query(Token).filter(
-        Token.token_hash == token,
-        Token.type == token_type,
-        Token.is_used == False,
+        Token.token == token,
+        Token.token_type == token_type,
+        Token.is_revoked == False,
         Token.expires_at > datetime.utcnow(),
     ).first()
 
@@ -111,9 +108,9 @@ def verify_token(
     if not db_obj:
         return None
     
-    # Mark the token as used for single-use tokens
+    # Mark the token as revoked for single-use tokens
     if token_type in [TokenType.EMAIL_VERIFICATION, TokenType.PASSWORD_RESET, TokenType.MFA]:
-        db_obj.is_used = True
+        db_obj.is_revoked = True
         db.add(db_obj)
         db.commit()
         db.refresh(db_obj)
@@ -121,17 +118,16 @@ def verify_token(
     return db_obj
 
 
-def revoke_refresh_token(db: Session, token: str) -> bool:
-    """Revoke a refresh token."""
+def revoke_token(db: Session, token: str) -> bool:
+    """Revoke a token."""
     db_obj = db.query(Token).filter(
-        Token.token_hash == token,
-        Token.type == TokenType.REFRESH,
+        Token.token == token,
     ).first()
     
     if not db_obj:
         return False
     
-    db_obj.is_used = True
+    db_obj.is_revoked = True
     db.add(db_obj)
     db.commit()
     
@@ -170,4 +166,7 @@ def is_valid_refresh_token(db: Session, token: str) -> bool:
 def delete_all_user_tokens(db: Session, user_id: UUID) -> None:
     """Delete all tokens for a user."""
     db.query(Token).filter(Token.user_id == user_id).delete()
+    db.commit()
+
+
     db.commit() 

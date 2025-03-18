@@ -1,31 +1,29 @@
 from enum import Enum
 from typing import Dict, Optional
+from datetime import date
 
 from pydantic import BaseModel, HttpUrl
-
-
-class OAuthProvider(str, Enum):
-    GOOGLE = "google"
-    FACEBOOK = "facebook"
+from app.core.enums import OAuthProvider
 
 
 class OAuthRequest(BaseModel):
-    provider: OAuthProvider
-    redirect_uri: Optional[HttpUrl] = None
+    redirect_uri: str
+    state: Optional[str] = None
 
 
 class OAuthCallback(BaseModel):
-    provider: OAuthProvider
     code: str
-    state: Optional[str] = None
-    redirect_uri: Optional[HttpUrl] = None
+    state: str
+    redirect_uri: str
 
 
 class OAuthUserInfo(BaseModel):
     provider: OAuthProvider
     provider_user_id: str
     email: str
-    first_name: str
-    last_name: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
     picture_url: Optional[str] = None
-    raw_data: Dict = {}
+    gender: Optional[str] = None
+    date_of_birth: Optional[date] = None
+    raw_data: Optional[Dict] = None

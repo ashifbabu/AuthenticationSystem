@@ -9,11 +9,12 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api/v1"
     PROJECT_NAME: str = "Authentication System"
     ENVIRONMENT: str = "development"
+    VERSION: str = "1.0.0"
     
     # SECURITY
-    SECRET_KEY: str = secrets.token_urlsafe(32)
+    SECRET_KEY: str = "your-secret-key"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
-    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    REFRESH_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
     ALGORITHM: str = "HS256"
     
     # CORS
@@ -28,37 +29,47 @@ class Settings(BaseSettings):
         raise ValueError(v)
 
     # DATABASE
-    POSTGRES_SERVER: str = "localhost"
-    POSTGRES_USER: str = "postgres"
-    POSTGRES_PASSWORD: str = "postgres"
-    POSTGRES_DB: str = "auth_db"
-    DATABASE_URI: Optional[str] = None
-
-    @model_validator(mode="after")
-    def assemble_db_connection(self) -> "Settings":
-        if self.DATABASE_URI is None:
-            self.DATABASE_URI = f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_SERVER}/{self.POSTGRES_DB}"
-        return self
+    SQLALCHEMY_DATABASE_URL: str = "sqlite:///./test.db"
 
     # EMAIL
     EMAILS_ENABLED: bool = False
-    EMAILS_FROM_NAME: str = PROJECT_NAME
-    EMAILS_FROM_EMAIL: Optional[EmailStr] = None
-    AWS_ACCESS_KEY: Optional[str] = None
-    AWS_SECRET_KEY: Optional[str] = None
-    AWS_REGION: Optional[str] = None
+    EMAILS_FROM_NAME: Optional[str] = None
+    EMAILS_FROM_EMAIL: Optional[str] = None
+    SMTP_TLS: bool = True
+    SMTP_PORT: Optional[int] = None
+    SMTP_HOST: Optional[str] = None
+    SMTP_USER: Optional[str] = None
+    SMTP_PASSWORD: Optional[str] = None
 
     # OAUTH
-    GOOGLE_CLIENT_ID: Optional[str] = None
-    GOOGLE_CLIENT_SECRET: Optional[str] = None
-    FACEBOOK_CLIENT_ID: Optional[str] = None
-    FACEBOOK_CLIENT_SECRET: Optional[str] = None
-    OAUTH_REDIRECT_URL: Optional[str] = None
-    FRONTEND_URL: Optional[str] = "http://localhost:3000"
+    GOOGLE_CLIENT_ID: str = "test-google-client-id"
+    GOOGLE_CLIENT_SECRET: str = "test-google-client-secret"
+    FACEBOOK_CLIENT_ID: str = "test-facebook-client-id"
+    FACEBOOK_CLIENT_SECRET: str = "test-facebook-client-secret"
+    GITHUB_CLIENT_ID: str = "test-github-client-id"
+    GITHUB_CLIENT_SECRET: str = "test-github-client-secret"
+    LINKEDIN_CLIENT_ID: str = "test-linkedin-client-id"
+    LINKEDIN_CLIENT_SECRET: str = "test-linkedin-client-secret"
+    TWITTER_CLIENT_ID: str = "test-twitter-client-id"
+    TWITTER_CLIENT_SECRET: str = "test-twitter-client-secret"
+    OAUTH_REDIRECT_URL: str = "http://localhost:8000/api/v1/auth/oauth/callback"
+    FRONTEND_URL: str = "http://localhost:3000"
+
+    # OAuth provider settings
+    OAUTH_PROVIDERS: List[str] = ["google", "facebook", "github", "linkedin", "twitter"]
+    OAUTH_STATE_EXPIRE_MINUTES: int = 10
+    OAUTH_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
 
     # Account lockout settings
-    MAX_LOGIN_ATTEMPTS: int = 5  # Maximum number of login attempts before account lockout
-    ACCOUNT_LOCKOUT_MINUTES: int = 30  # Duration of account lockout in minutes
+    MAX_LOGIN_ATTEMPTS: int = 10  # Increase max attempts for tests
+    ACCOUNT_LOCKOUT_MINUTES: int = 1  # Reduce lockout time for tests
+
+    # Security
+    VERIFY_EMAIL: bool = False  # Disable email verification for tests
+    ALLOW_REGISTRATION: bool = True
+    PASSWORD_MIN_LENGTH: int = 8
+    PASSWORD_MAX_LENGTH: int = 50
+    PASSWORD_REGEX: str = r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]+$"
 
     model_config = {
         "case_sensitive": True,

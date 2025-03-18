@@ -16,24 +16,27 @@ class UserBase(BaseModel):
     first_name: str
     last_name: str
     email: EmailStr
-    mobile: str
-    date_of_birth: date
-    gender: Gender
+    mobile: Optional[str] = None
+    date_of_birth: Optional[date] = None
+    gender: Optional[Gender] = None
 
 
 class UserCreate(UserBase):
-    password: str = Field(..., min_length=8)
-    confirm_password: str
+    password: Optional[str] = None
+    confirm_password: Optional[str] = None
+    is_email_verified: bool = False
 
     @validator("confirm_password")
     def passwords_match(cls, v, values, **kwargs):
-        if "password" in values and v != values["password"]:
+        if "password" in values and values["password"] and v != values["password"]:
             raise ValueError("Passwords do not match")
         return v
     
     @validator("password")
     def password_strength(cls, v):
         """Validate password strength."""
+        if v is None:
+            return v
         if len(v) < 8:
             raise ValueError("Password must be at least 8 characters long")
         
@@ -60,6 +63,8 @@ class UserCreate(UserBase):
     @validator("mobile")
     def validate_mobile(cls, v):
         """Validate Bangladeshi phone number format."""
+        if v is None:
+            return v
         import re
         pattern = r"^\+880\d{10}$"
         if not re.match(pattern, v):
@@ -69,6 +74,8 @@ class UserCreate(UserBase):
     @validator("date_of_birth")
     def validate_age(cls, v):
         """Validate that user is at least 13 years old."""
+        if v is None:
+            return v
         today = datetime.now().date()
         age = today.year - v.year - ((today.month, today.day) < (v.month, v.day))
         if age < 13:
@@ -107,6 +114,17 @@ class UserInDB(UserBase):
     is_email_verified: bool
     mfa_enabled: bool
     is_superuser: bool
+
+    class Config:
+        from_attributes = True
+
+
+class MFAResponse(BaseModel):
+    """Response schema for MFA-related endpoints."""
+    qr_code: Optional[str] = None
+    secret: Optional[str] = None
+    is_enabled: bool
+    backup_codes: Optional[list[str]] = None
 
     class Config:
         from_attributes = True 

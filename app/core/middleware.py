@@ -150,20 +150,19 @@ def add_middlewares(app: FastAPI) -> None:
     app.add_middleware(
         RateLimitingMiddleware,
         default_limit=100,
-        default_window=60,  # 100 requests per minute by default
+        default_window=60,
         path_limits={
-            "/api/v1/auth/login": (5, 60),  # 5 login attempts per minute
-            "/api/v1/auth/register": (3, 60),  # 3 registration attempts per minute
-            "/api/v1/auth/forgot-password": (3, 60),  # 3 password reset attempts per minute
-        },
+            "/api/v1/auth/login": (5, 60),  # 5 requests per minute for login
+            "/api/v1/auth/register": (3, 60),  # 3 requests per minute for registration
+        }
     )
     
-    # Add CSRF middleware
+    # Add CSRF middleware with excluded paths
     app.add_middleware(
         CSRFMiddleware,
         exclude_paths=[
-            "/api/v1/auth/login",
-            "/api/v1/auth/register",
-            "/api/v1/auth/oauth",
-        ],
+            "/api/v1/auth/oauth",  # Exclude all OAuth routes
+            "/api/v1/auth/login",  # Exclude login route
+            "/api/v1/auth/register",  # Exclude registration route
+        ]
     ) 

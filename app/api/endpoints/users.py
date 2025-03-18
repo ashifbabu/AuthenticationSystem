@@ -3,11 +3,11 @@ from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Body
 from sqlalchemy.orm import Session
 
-from app.api.dependencies.deps import get_db
-from app.crud import user as user_crud
 from app.api.dependencies.auth import get_current_active_user, get_current_verified_user
+from app.db.session import get_db
+from app.crud import user as user_crud
 from app.core.security import verify_password
-from app.models.oauth_account import OAuthProvider
+from app.models.oauth import OAuthProvider
 from app.models.user import User
 from app.schemas.oauth import OAuthUserInfo
 from app.schemas.user import User as UserSchema, UserUpdate
@@ -109,40 +109,20 @@ def delete_oauth_account(
 
 
 @router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
-def delete_account(
+def delete_current_user(
     *,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_verified_user),
-    password: str = Body(..., embed=True),
-) -> Any:
+    password: str = Body(...),
+) -> None:
     """
-    Delete the current user's account.
-    
-    This operation:
-    - Requires password confirmation for security
-    - Permanently deletes the user and all associated data
-    - Invalidates all access and refresh tokens
-    - Deletes all OAuth accounts
-    
-    This action cannot be undone.
+    Delete current user.
     """
-    # Verify the password unless the user only has OAuth accounts
-    if current_user.password_hash:
-        if not verify_password(password, current_user.password_hash):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Incorrect password",
-            )
+    if not verify_password(password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Incorrect password",
+        )
     
-    # Delete all associated data (cascade delete through foreign keys)
-    # 1. Delete all tokens
-    user_crud.delete_all_user_tokens(db, user_id=current_user.id)
-    
-    # 2. Delete all OAuth accounts
-    for oauth_account in current_user.oauth_accounts:
-        user_crud.delete(db, oauth_account_id=oauth_account.id)
-    
-    # 3. Delete the user
-    user_crud.delete(db, user_id=current_user.id)
-    
+    user_crud.delete(db, id=current_user.id)
     return None 

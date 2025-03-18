@@ -1,17 +1,28 @@
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 import secrets
+from urllib.parse import urlencode
 
-from fastapi import APIRouter, Body, Depends, HTTPException, status, Request, BackgroundTasks
+from fastapi import APIRouter, Body, Depends, HTTPException, status, Request, BackgroundTasks, Query
 from fastapi.security import OAuth2PasswordRequestForm
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 from jose import jwt
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
-from app.api.dependencies.deps import get_db
-from app.crud import user as user_crud
+from app import crud
+from app.api import deps
+from app.core import security
 from app.core.config import settings
+from app.core.enums import OAuthProvider
+from app.models.user import User
+from app.models.token import TokenType
+from app.models.login_attempt import LoginAttempt
+from app.schemas.token import Token
+from app.schemas.user import UserCreate, UserUpdate, User as UserSchema, MFAResponse
+from app.schemas.password import PasswordChange, PasswordReset
+from app.db.session import get_db
+from app.api.deps import get_current_user
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -19,10 +30,8 @@ from app.core.security import (
     generate_verification_token,
     generate_mfa_code,
     verify_password,
+    get_password_hash,
 )
-from app.models.token import TokenType
-from app.models.user import User
-from app.models.oauth_account import OAuthProvider
 from app.schemas.auth import (
     ChangePassword,
     ForgotPassword,
@@ -39,9 +48,55 @@ from app.schemas.oauth import OAuthCallback, OAuthRequest, OAuthUserInfo
 from app.schemas.password import PasswordReset, PasswordResetRequest
 from app.schemas.mfa import MFADisable, MFAResponse, MFAVerify
 from app.schemas.login_attempt import LoginAttemptStats
+from app.services.oauth import (
+    get_oauth_login_url,
+    exchange_code_for_token,
+    get_user_info,
+)
+from app.crud.user import (
+    get_by_email,
+    create as create_user,
+    authenticate,
+    set_email_verified,
+    update as update_user,
+    set_password,
+    enable_mfa,
+    delete as delete_user,
+    get_by_id,
+)
+from app.crud.token import (
+    create_access_token as create_db_access_token,
+    create_refresh_token as create_db_refresh_token,
+    get_token,
+    revoke_token,
+    create_verification_token,
+)
+from app.crud.oauth_account import (
+    get_by_provider_and_user as get_oauth_account,
+    create as create_oauth_account,
+)
+from app.crud.login_attempt import (
+    create as create_login_attempt,
+    count_recent_failed_attempts,
+)
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.get("/csrf-token")
+def get_csrf_token():
+    """Get a CSRF token for form submissions."""
+    token = secrets.token_urlsafe(32)
+    response = JSONResponse(content={"csrf_token": token})
+    response.set_cookie(
+        key="csrf_token",
+        value=token,
+        httponly=True,
+        secure=True,
+        samesite="lax"
+    )
+    return response
 
 
 @router.post("/register", response_model=UserSchema)
@@ -54,7 +109,7 @@ def register_user(
     Register a new user.
     """
     # Check if a user with the given email already exists
-    existing_user = user_crud.get_by_email(db, email=user_in.email)
+    existing_user = get_by_email(db, email=user_in.email)
     if existing_user:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -62,16 +117,16 @@ def register_user(
         )
     
     # Create the user
-    user = user_crud.create(db, obj_in=user_in)
+    user = create_user(db, obj_in=user_in)
     
     # Generate and store email verification token
     token = generate_verification_token()
-    user_crud.create_verification_token(
+    crud.token.create_verification_token(
         db=db,
         user_id=user.id,
         token=token,
         token_type=TokenType.EMAIL_VERIFICATION,
-        expires_delta=timedelta(hours=24),
+        expires_delta=timedelta(hours=24)
     )
     
     # Send verification email
@@ -90,27 +145,31 @@ def verify_email(
     Verify a user's email address using the token sent via email.
     """
     # Verify the token
-    verification_token = user_crud.verify_token(
-        db=db,
-        token=token_in.token,
-        token_type=TokenType.EMAIL_VERIFICATION,
-    )
-    
+    verification_token = crud.token.get_token(db, token=token_in.token, token_type=TokenType.EMAIL_VERIFICATION)
     if not verification_token:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or expired token",
+            detail="Invalid or expired verification token",
         )
     
-    # Get the user and mark email as verified
-    user = user_crud.get_by_id(db, user_id=verification_token.user_id)
+    # Get the user
+    user = crud.user.get(db, id=verification_token.user_id)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found",
         )
     
-    user = crud.user.set_email_verified(db, user=user)
+    # Update user's email verification status
+    user = crud.user.update(
+        db,
+        db_obj=user,
+        obj_in={"is_email_verified": True}
+    )
+    
+    # Delete the used token
+    crud.token.delete_token(db, token=token_in.token)
+    
     return user
 
 
@@ -132,155 +191,62 @@ def login(
     password = form_data.password
     
     # Extract client information
-    ip_address = request.client.host
-    user_agent = request.headers.get("user-agent", "")
+    ip_address = request.client.host if request.client else "127.0.0.1"
+    user_agent = request.headers.get("user-agent", "Unknown")
     
     # Check if the account is locked due to too many failed attempts
     if crud.login_attempt.is_account_locked(
         db, email=email, max_attempts=settings.MAX_LOGIN_ATTEMPTS, lockout_minutes=settings.ACCOUNT_LOCKOUT_MINUTES
     ):
-        # Record the failed attempt
-        crud.login_attempt.create(
-            db, email=email, ip_address=ip_address, user_agent=user_agent, success=False
-        )
-        
-        # Check if the user exists to send a notification
-        user = crud.user.get_by_email(db, email=email)
-        if user:
-            # Send a security notification email
-            background_tasks.add_task(
-                email.send_security_notification_email,
-                email_to=user.email,
-                event_type="account_locked",
-                details={
-                    "timestamp": datetime.utcnow(),
-                    "ip_address": ip_address,
-                    "user_agent": user_agent,
-                    "location": "Unknown (IP geolocation not implemented)",
-                },
-                username=user.first_name,
-            )
-        
-        # Return an error with information about the lockout
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Account temporarily locked due to too many failed login attempts. "
-                   f"Please try again after {settings.ACCOUNT_LOCKOUT_MINUTES} minutes or reset your password.",
-        )
-    
-    # Authenticate the user
-    user = crud.user.authenticate(db, email=email, password=password)
-    
-    if not user:
-        # Record the failed attempt
-        crud.login_attempt.create(
-            db, email=email, ip_address=ip_address, user_agent=user_agent, success=False
-        )
-        
-        # Get the count of recent failed attempts to include in the error message
-        failed_attempts = crud.login_attempt.count_recent_failed_attempts(
-            db, email=email, minutes=settings.ACCOUNT_LOCKOUT_MINUTES
-        )
-        attempts_left = settings.MAX_LOGIN_ATTEMPTS - failed_attempts
-        
-        if attempts_left <= 0:
-            detail = f"Account temporarily locked due to too many failed login attempts. " \
-                     f"Please try again after {settings.ACCOUNT_LOCKOUT_MINUTES} minutes or reset your password."
-        else:
-            detail = f"Incorrect email or password. {attempts_left} attempts remaining before account is locked."
-        
-        # If we're approaching the lockout threshold, send a notification if the user exists
-        if failed_attempts >= settings.MAX_LOGIN_ATTEMPTS - 2:  # Send when 2 or fewer attempts left
-            potential_user = crud.user.get_by_email(db, email=email)
-            if potential_user:
-                background_tasks.add_task(
-                    email.send_security_notification_email,
-                    email_to=potential_user.email,
-                    event_type="login_attempt",
-                    details={
-                        "timestamp": datetime.utcnow(),
-                        "ip_address": ip_address,
-                        "user_agent": user_agent,
-                        "location": "Unknown (IP geolocation not implemented)",
-                        "attempts_remaining": attempts_left,
-                        "status": "Failed login attempt",
-                    },
-                    username=potential_user.first_name,
-                )
-        
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=detail,
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    if not crud.user.is_active(user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Inactive user",
+            detail="Account is temporarily locked due to too many failed login attempts",
         )
     
-    # Record the successful attempt
+    # Authenticate user
+    user = crud.user.authenticate(db, email=email, password=password)
+    if not user:
+        # Record failed login attempt
+        crud.login_attempt.create(
+            db,
+            email=email,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            success=False
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+        )
+    
+    # Record successful login attempt
     crud.login_attempt.create(
-        db, email=email, ip_address=ip_address, user_agent=user_agent, success=True
+        db,
+        email=email,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        success=True
     )
+    
+    # Check if email is verified
+    if not user.is_email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Please verify your email before logging in",
+        )
     
     # Create access and refresh tokens
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    refresh_token_expires = timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-    
-    access_token = create_access_token(user.id, expires_delta=access_token_expires)
-    refresh_token = create_refresh_token(user.id, expires_delta=refresh_token_expires)
+    access_token = create_access_token(subject=user.id)
+    refresh_token = create_refresh_token(user_id=user.id)
     
     # Store tokens in the database
-    crud.token.create_access_token(
-        db=db,
-        user_id=user.id,
-        token=access_token,
-        expires_delta=access_token_expires,
-    )
-    
-    crud.token.create_refresh_token(
-        db=db,
-        user_id=user.id,
-        token=refresh_token,
-        expires_delta=refresh_token_expires,
-    )
-    
-    # Update last_login timestamp
-    crud.user.update_last_login(db, user=user)
-    
-    # Check if this is a login from a new IP or device and notify the user
-    recent_successful_logins = db.query(models.LoginAttempt).filter(
-        models.LoginAttempt.email == email,
-        models.LoginAttempt.success == True,
-        models.LoginAttempt.timestamp >= datetime.utcnow() - timedelta(days=30)
-    ).all()
-    
-    # If this is the first successful login or from a new IP/device
-    if len(recent_successful_logins) <= 1 or not any(
-        attempt.ip_address == ip_address and attempt.user_agent == user_agent
-        for attempt in recent_successful_logins[1:]  # Skip the current login
-    ):
-        # Send a notification about the new device login
-        background_tasks.add_task(
-            email.send_security_notification_email,
-            email_to=user.email,
-            event_type="login_attempt",
-            details={
-                "timestamp": datetime.utcnow(),
-                "ip_address": ip_address,
-                "user_agent": user_agent,
-                "location": "Unknown (IP geolocation not implemented)",
-                "status": "Successful login from new device or location",
-            },
-            username=user.first_name,
-        )
+    create_db_access_token(db, user_id=user.id, token=access_token)
+    create_db_refresh_token(db, user_id=user.id, token=refresh_token)
     
     return {
         "access_token": access_token,
-        "token_type": "bearer",
         "refresh_token": refresh_token,
+        "token_type": "bearer"
     }
 
 
@@ -309,7 +275,7 @@ def refresh_token(
         )
     
     # Check if the token has been revoked
-    if not crud.token.is_valid_refresh_token(db, token=refresh_token_in.refresh_token):
+    if not crud.token.get_token(db, token=refresh_token_in.refresh_token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token has been revoked",
@@ -317,7 +283,7 @@ def refresh_token(
         )
     
     # Get the user
-    user = crud.user.get_by_id(db, user_id=token_data.sub)
+    user = crud.user.get(db, id=token_data.sub)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -331,21 +297,15 @@ def refresh_token(
         )
     
     # Create new access token
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(user.id, expires_delta=access_token_expires)
+    access_token = create_access_token(subject=user.id)
     
-    # Store new access token in the database
-    crud.token.create_access_token(
-        db=db,
-        user_id=user.id,
-        token=access_token,
-        expires_delta=access_token_expires,
-    )
+    # Store the new access token
+    crud.token.create_access_token(db, user_id=user.id, token=access_token)
     
     return {
         "access_token": access_token,
-        "token_type": "bearer",
         "refresh_token": refresh_token_in.refresh_token,
+        "token_type": "bearer"
     }
 
 
@@ -353,13 +313,14 @@ def refresh_token(
 def logout(
     *,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(get_current_user),
     refresh_token_in: RefreshToken,
-) -> Any:
+) -> None:
     """
     Logout the current user by revoking the refresh token.
     """
-    crud.token.revoke_refresh_token(db, token=refresh_token_in.refresh_token)
+    # Revoke the refresh token
+    revoke_token(db, token=refresh_token_in.refresh_token)
     return None
 
 
@@ -367,39 +328,19 @@ def logout(
 def forgot_password(
     *,
     db: Session = Depends(get_db),
-    request_in: PasswordResetRequest,
+    email_in: str = Body(..., embed=True),
     background_tasks: BackgroundTasks,
-) -> Any:
+) -> None:
     """
-    Initiates the password reset process.
-    
-    Sends a password reset email to the provided email address if it exists in the system.
-    Always returns a 204 response for security reasons (to not leak whether an email exists).
+    Password recovery email.
     """
-    # Check if the user exists
-    user = crud.user.get_by_email(db, email=request_in.email)
-    if not user:
-        # Return success even if the user doesn't exist for security reasons
-        return None
-    
-    # Create a password reset token
-    reset_token_value = generate_password_reset_token()
-    reset_token = crud.token.create_verification_token(
-        db=db,
-        user_id=user.id,
-        token=reset_token_value,
-        token_type=TokenType.PASSWORD_RESET,
-        expires_delta=timedelta(hours=24),  # Token valid for 24 hours
-    )
-    
-    # Send the password reset email
-    background_tasks.add_task(
-        email.send_password_reset_email,
-        email_to=user.email,
-        token=reset_token_value,
-        username=user.first_name,
-    )
-    
+    user = get_by_email(db, email=email_in)
+    if user:
+        token = generate_password_reset_token()
+        set_email_verified(db, user=user, token=token, token_type=TokenType.PASSWORD_RESET, expires_delta=timedelta(hours=24))
+        background_tasks.add_task(
+            email.send_password_reset_email, user.email, token
+        )
     return None
 
 
@@ -418,11 +359,7 @@ def reset_password(
     Sends security notification for password reset.
     """
     # Verify the token
-    token = crud.token.verify_token(
-        db=db,
-        token=reset_in.token,
-        token_type=TokenType.PASSWORD_RESET,
-    )
+    token = get_token(db, token=reset_in.token, token_type=TokenType.PASSWORD_RESET)
     
     if not token:
         raise HTTPException(
@@ -431,7 +368,7 @@ def reset_password(
         )
     
     # Get the user
-    user = crud.user.get_by_id(db, user_id=token.user_id)
+    user = get_by_email(db, user_id=token.user_id)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -440,7 +377,7 @@ def reset_password(
     
     # Update the password
     user_in = {"password": reset_in.new_password}
-    crud.user.update(db, db_obj=user, obj_in=user_in)
+    update_user(db, db_obj=user, obj_in=user_in)
     
     # Extract client information
     ip_address = request.client.host
@@ -463,28 +400,18 @@ def reset_password(
     
     # Create access and refresh tokens
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    refresh_token_expires = timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    refresh_token_expires = timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES)
     
     access_token = create_access_token(user.id, expires_delta=access_token_expires)
-    refresh_token = create_refresh_token(user.id, expires_delta=refresh_token_expires)
+    refresh_token = create_refresh_token(user_id=user.id, expires_delta=refresh_token_expires)
     
     # Store the tokens in the database
-    crud.token.create_access_token(
-        db=db,
-        user_id=user.id,
-        token=access_token,
-        expires_delta=access_token_expires,
-    )
+    create_db_access_token(db, user_id=user.id, token=access_token, expires_delta=access_token_expires)
     
-    crud.token.create_refresh_token(
-        db=db,
-        user_id=user.id,
-        token=refresh_token,
-        expires_delta=refresh_token_expires,
-    )
+    create_db_refresh_token(db, user_id=user.id, token=refresh_token, expires_delta=refresh_token_expires)
     
     # Update last login timestamp
-    crud.user.update_last_login(db, user=user)
+    update_user(db, db_obj=user, obj_in={"last_login": datetime.utcnow()})
     
     return {
         "access_token": access_token,
@@ -497,69 +424,24 @@ def reset_password(
 def change_password(
     *,
     db: Session = Depends(get_db),
-    current_user: User = Depends(deps.get_current_verified_user),
-    current_password: str = Body(...),
-    new_password: str = Body(...),
-    request: Request,
-    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    password_in: ChangePassword,
 ) -> Any:
     """
-    Change the user's password.
-    
-    Requires the current password for verification.
-    Returns new access and refresh tokens.
-    Sends security notification for password change.
+    Change password for the current user.
     """
-    # Verify the current password
-    if not verify_password(current_password, current_user.password_hash):
+    if not verify_password(password_in.current_password, current_user.hashed_password):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Incorrect password",
         )
     
-    # Update the password
-    user_in = {"password": new_password}
-    user = crud.user.update(db, db_obj=current_user, obj_in=user_in)
+    # Update password
+    set_password(db, user=current_user, new_password=password_in.new_password)
     
-    # Extract client information
-    ip_address = request.client.host
-    user_agent = request.headers.get("user-agent", "")
-    
-    # Send a security notification email
-    background_tasks.add_task(
-        email.send_security_notification_email,
-        email_to=user.email,
-        event_type="password_change",
-        details={
-            "timestamp": datetime.utcnow(),
-            "ip_address": ip_address,
-            "user_agent": user_agent,
-            "location": "Unknown (IP geolocation not implemented)",
-        },
-        username=user.first_name,
-    )
-    
-    # Create access and refresh tokens
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    refresh_token_expires = timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-    
-    access_token = create_access_token(user.id, expires_delta=access_token_expires)
-    refresh_token = create_refresh_token(user.id, expires_delta=refresh_token_expires)
-    
-    # Store the tokens in the database
-    crud.token.create_access_token(
-        db=db,
-        user_id=user.id,
-        token=access_token,
-        expires_delta=access_token_expires,
-    )
-    
-    crud.token.create_refresh_token(
-        db=db,
-        user_id=user.id,
-        token=refresh_token,
-        expires_delta=refresh_token_expires,
-    )
+    # Create new tokens
+    access_token = create_access_token(subject=current_user.id)
+    refresh_token = create_refresh_token(user_id=current_user.id)
     
     return {
         "access_token": access_token,
@@ -568,282 +450,199 @@ def change_password(
     }
 
 
-@router.post("/mfa/enable", response_model=UserSchema)
+@router.post("/mfa/enable", response_model=MFAResponse)
 def enable_mfa(
     *,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_verified_user),
-    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
 ) -> Any:
     """
     Enable MFA for the current user.
-    
-    Generates an MFA verification code and sends it to the user's email.
-    Returns a message with instructions.
     """
-    # Generate an MFA verification code
+    if current_user.mfa_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MFA is already enabled",
+        )
+    
+    # Generate MFA code
     mfa_code = generate_mfa_code()
     
-    # Store the MFA verification code
-    mfa_token = crud.token.create_verification_token(
-        db=db,
-        user_id=current_user.id,
-        token=mfa_code,
-        token_type=TokenType.MFA,
-        expires_delta=timedelta(minutes=10),  # Short expiration for security
-    )
+    # Store MFA code
+    set_email_verified(db, user=current_user, token=mfa_code, token_type=TokenType.MFA, expires_delta=timedelta(minutes=10))
     
-    # Send the MFA verification code via email
-    background_tasks.add_task(
-        email.send_mfa_code_email,
-        email_to=current_user.email,
-        code=mfa_code,
-        username=current_user.first_name,
-    )
+    # Send MFA code via email
+    email.send_mfa_code_email(current_user.email, mfa_code)
     
-    return {
-        "message": "An MFA verification code has been sent to your email. Use this code to verify and enable MFA."
-    }
+    return {"mfa_enabled": True}
 
 
-@router.post("/mfa/verify", response_model=UserSchema)
+@router.post("/mfa/verify", response_model=MFAResponse)
 def verify_mfa(
     *,
     db: Session = Depends(get_db),
-    current_user: User = Depends(deps.get_current_verified_user),
+    current_user: User = Depends(get_current_user),
     mfa_in: MFAVerify,
-    request: Request,
-    background_tasks: BackgroundTasks,
 ) -> Any:
     """
-    Verify the MFA code and enable MFA for the user.
-    
-    Verifies the MFA code sent to the user's email.
-    If valid, enables MFA for the user.
-    Sends security notification for MFA enablement.
+    Verify MFA code and enable MFA for the user.
     """
-    # Verify the MFA code
-    token = crud.token.verify_token(
-        db=db,
-        token=mfa_in.code,
-        token_type=TokenType.MFA,
-    )
+    # Verify MFA code
+    token = get_token(db, token=mfa_in.code, token_type=TokenType.MFA)
     
     if not token or token.user_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or expired MFA code",
+            detail="Invalid MFA code",
         )
     
-    # Enable MFA for the user
-    user = crud.user.enable_mfa(db, user=current_user, enable=True)
+    # Enable MFA
+    update_user(db, db_obj=current_user, obj_in={"mfa_enabled": True})
     
-    # Extract client information
-    ip_address = request.client.host
-    user_agent = request.headers.get("user-agent", "")
-    
-    # Send a security notification email
-    background_tasks.add_task(
-        email.send_security_notification_email,
-        email_to=user.email,
-        event_type="mfa_enabled",
-        details={
-            "timestamp": datetime.utcnow(),
-            "ip_address": ip_address,
-            "user_agent": user_agent,
-            "location": "Unknown (IP geolocation not implemented)",
-        },
-        username=user.first_name,
-    )
-    
-    return user
+    return {"mfa_verified": True}
 
 
-@router.post("/mfa/disable", response_model=UserSchema)
+@router.post("/mfa/disable", response_model=MFAResponse)
 def disable_mfa(
     *,
     db: Session = Depends(get_db),
-    current_user: User = Depends(deps.get_current_verified_user),
+    current_user: User = Depends(get_current_user),
     mfa_in: MFADisable,
-    request: Request,
-    background_tasks: BackgroundTasks,
 ) -> Any:
     """
-    Disable MFA for the user.
-    
-    Requires the user's password for verification.
-    Sends security notification for MFA disablement.
+    Disable MFA for the current user.
     """
-    # Verify the password
-    if not verify_password(mfa_in.password, current_user.password_hash):
+    if not current_user.mfa_enabled:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MFA is not enabled",
+        )
+    
+    # Verify password
+    if not verify_password(mfa_in.password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Incorrect password",
         )
     
-    # Disable MFA for the user
-    user = crud.user.enable_mfa(db, user=current_user, enable=False)
+    # Disable MFA
+    update_user(db, db_obj=current_user, obj_in={"mfa_enabled": False})
     
-    # Extract client information
-    ip_address = request.client.host
-    user_agent = request.headers.get("user-agent", "")
-    
-    # Send a security notification email
-    background_tasks.add_task(
-        email.send_security_notification_email,
-        email_to=user.email,
-        event_type="mfa_disabled",
-        details={
-            "timestamp": datetime.utcnow(),
-            "ip_address": ip_address,
-            "user_agent": user_agent,
-            "location": "Unknown (IP geolocation not implemented)",
-        },
-        username=user.first_name,
-    )
-    
-    return user
+    return {"mfa_enabled": False}
 
 
-@router.get("/oauth/{provider}", status_code=status.HTTP_302_FOUND)
-async def oauth_login(
-    provider: OAuthProvider,
-    request: Request,
-    redirect_uri: Optional[str] = None,
-) -> RedirectResponse:
-    """
-    Initiate OAuth login flow for the specified provider.
-    """
-    # Generate the OAuth login URL
-    login_url = get_oauth_login_url(provider, redirect_uri)
-    
-    # Redirect the user to the provider's login page
-    return RedirectResponse(url=login_url)
-
-
-@router.get("/oauth/callback", response_model=Token)
-async def oauth_callback(
-    *,
+@router.post("/oauth/{provider}/login")
+def oauth_login(
+    provider: str,
+    oauth_request: OAuthRequest,
     db: Session = Depends(get_db),
-    provider: OAuthProvider,
-    code: str,
-    state: Optional[str] = None,
-    redirect_uri: Optional[str] = None,
 ) -> Any:
     """
-    Handle OAuth callback and authenticate the user.
+    Initiate OAuth login flow.
     """
-    # Exchange the authorization code for an access token
-    token_data = await exchange_code_for_token(provider, code, redirect_uri)
+    try:
+        oauth_provider = OAuthProvider(provider.lower())
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported OAuth provider: {provider}"
+        )
     
-    # Get user information from the provider
-    user_info = await get_user_info(provider, token_data)
+    # Generate OAuth login URL with state
+    login_url = get_oauth_login_url(oauth_provider, oauth_request.redirect_uri, oauth_request.state)
     
-    # Check if there's an existing OAuth account
-    oauth_account = crud.oauth_account.get_by_provider_and_id(
-        db, provider=user_info.provider, provider_user_id=user_info.provider_user_id
+    # Return redirect response
+    return RedirectResponse(url=login_url, status_code=status.HTTP_302_FOUND)
+
+
+@router.post("/oauth/{provider}/callback")
+async def oauth_callback(
+    provider: str,
+    oauth_callback: OAuthCallback,
+    db: Session = Depends(get_db),
+) -> Any:
+    """
+    Handle OAuth callback and create/update user.
+    """
+    try:
+        oauth_provider = OAuthProvider(provider.lower())
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported OAuth provider: {provider}"
+        )
+    
+    # Exchange code for token
+    token_data = await exchange_code_for_token(oauth_provider, oauth_callback.code, oauth_callback.redirect_uri)
+    
+    # Get user info from provider
+    user_info = await get_user_info(oauth_provider, token_data)
+    
+    # Check if user already exists with this OAuth account
+    oauth_account = crud.oauth_account.get_by_provider_and_user(
+        db,
+        provider=oauth_provider,
+        provider_user_id=user_info.provider_user_id
     )
     
-    user = None
-    
     if oauth_account:
-        # User already exists, get the user
-        user = crud.user.get_by_id(db, user_id=oauth_account.user_id)
+        # Get existing user
+        user = crud.user.get(db, id=oauth_account.user_id)
         if not user:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found",
+                detail="User not found"
             )
     else:
-        # Check if there's a user with the same email
+        # Check if user exists with this email
         user = crud.user.get_by_email(db, email=user_info.email)
-        
         if user:
-            # Link the existing user with the OAuth account
-            oauth_account = crud.oauth_account.create(
-                db=db,
+            # Link OAuth account to existing user
+            crud.oauth_account.create(
+                db,
                 user_id=user.id,
-                provider=user_info.provider,
+                provider=oauth_provider,
                 provider_user_id=user_info.provider_user_id,
+                access_token=token_data["access_token"],
+                refresh_token=token_data.get("refresh_token"),
+                expires_at=token_data["expires_at"]
             )
         else:
-            # Create a new user
-            import uuid
-            from datetime import date
-            from app.schemas.user import Gender, UserCreate
-            
-            # Generate a secure random password that the user doesn't need to know
-            random_password = secrets.token_urlsafe(16)
-            
+            # Create new user
             user_in = UserCreate(
+                email=user_info.email,
                 first_name=user_info.first_name,
                 last_name=user_info.last_name,
-                date_of_birth=date(1900, 1, 1),  # Default date, can be updated later
-                gender=Gender.PREFER_NOT_TO_SAY,  # Default gender, can be updated later
-                email=user_info.email,
-                mobile="+8801700000000",  # Default mobile, must be updated later
-                password=random_password,
-                confirm_password=random_password,
-            )
-            
-            # Override validation for OAuth users
-            user = User(
-                id=uuid.uuid4(),
-                first_name=user_info.first_name,
-                last_name=user_info.last_name,
-                date_of_birth=date(1900, 1, 1),
-                gender=Gender.PREFER_NOT_TO_SAY,
-                email=user_info.email,
-                mobile="+8801700000000",
-                password_hash=crud.user.get_password_hash(random_password),
                 is_active=True,
-                is_email_verified=True,  # OAuth users are considered verified
-                mfa_enabled=False,
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow(),
+                is_email_verified=True,  # OAuth emails are pre-verified
+                gender=user_info.gender,
+                date_of_birth=user_info.date_of_birth
             )
+            user = crud.user.create(db, obj_in=user_in)
             
-            db.add(user)
-            db.commit()
-            db.refresh(user)
-            
-            # Create the OAuth account
-            oauth_account = crud.oauth_account.create(
-                db=db,
+            # Create OAuth account
+            crud.oauth_account.create(
+                db,
                 user_id=user.id,
-                provider=user_info.provider,
+                provider=oauth_provider,
                 provider_user_id=user_info.provider_user_id,
+                access_token=token_data["access_token"],
+                refresh_token=token_data.get("refresh_token"),
+                expires_at=token_data["expires_at"]
             )
     
     # Create access and refresh tokens
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    refresh_token_expires = timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-    
-    access_token = create_access_token(user.id, expires_delta=access_token_expires)
-    refresh_token = create_refresh_token(user.id, expires_delta=refresh_token_expires)
+    access_token = create_access_token(subject=user.id)
+    refresh_token = create_refresh_token(user_id=user.id)
     
     # Store tokens in the database
-    crud.token.create_access_token(
-        db=db,
-        user_id=user.id,
-        token=access_token,
-        expires_delta=access_token_expires,
-    )
-    
-    crud.token.create_refresh_token(
-        db=db,
-        user_id=user.id,
-        token=refresh_token,
-        expires_delta=refresh_token_expires,
-    )
-    
-    # Update last_login timestamp
-    crud.user.update_last_login(db, user=user)
+    crud.token.create_access_token(db, user_id=user.id, token=access_token)
+    crud.token.create_refresh_token(db, user_id=user.id, token=refresh_token)
     
     return {
         "access_token": access_token,
-        "token_type": "bearer",
         "refresh_token": refresh_token,
+        "token_type": "bearer"
     }
 
 
@@ -852,7 +651,7 @@ def check_account_status(
     *,
     db: Session = Depends(get_db),
     email: str,
-    current_user: User = Depends(get_current_verified_user),
+    current_user: User = Depends(get_current_user),
 ) -> Any:
     """
     Check account lockout status and login attempt statistics.
@@ -867,9 +666,7 @@ def check_account_status(
         )
     
     # Get account statistics
-    recent_attempts = len(crud.login_attempt.get_recent_attempts(
-        db, email=email, minutes=settings.ACCOUNT_LOCKOUT_MINUTES
-    ))
+    recent_attempts = len(get_recent_attempts(db, email=email, minutes=settings.ACCOUNT_LOCKOUT_MINUTES))
     
     recent_failed_attempts = crud.login_attempt.count_recent_failed_attempts(
         db, email=email, minutes=settings.ACCOUNT_LOCKOUT_MINUTES
@@ -882,9 +679,7 @@ def check_account_status(
     lockout_remaining = None
     if is_locked:
         # Calculate remaining lockout time
-        most_recent_attempt = crud.login_attempt.get_recent_failed_attempts(
-            db, email=email, minutes=settings.ACCOUNT_LOCKOUT_MINUTES
-        )[0]
+        most_recent_attempt = get_recent_attempts(db, email=email, minutes=settings.ACCOUNT_LOCKOUT_MINUTES)[0]
         
         from datetime import datetime
         elapsed_minutes = (datetime.utcnow() - most_recent_attempt.timestamp).total_seconds() / 60
@@ -902,37 +697,61 @@ def check_account_status(
 def unlock_account(
     *,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
     email: str,
-    current_user: User = Depends(get_current_verified_user),
-) -> Any:
+) -> None:
     """
-    Unlock an account that has been locked due to too many failed login attempts.
-    
-    This endpoint is restricted to admins only.
+    Unlock a user account.
     """
-    # Only admins can unlock accounts
-    if not current_user.is_superuser:
+    # Check if the user has admin privileges
+    if not current_user.is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to unlock accounts",
+            detail="Not enough privileges",
         )
     
-    # Check if the user exists
-    user = crud.user.get_by_email(db, email=email)
+    # Get the user to unlock
+    user = get_by_email(db, email=email)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found",
         )
     
-    # Delete all failed login attempts for this user
-    from sqlalchemy import and_
-    db.query(models.LoginAttempt).filter(
-        and_(
-            models.LoginAttempt.email == email,
-            models.LoginAttempt.success == False,
+    # Unlock the account
+    update_user(db, db_obj=user, obj_in={"is_locked": False})
+    return None
+
+
+def get_oauth_login_url(provider: OAuthProvider, redirect_uri: str = None, state: Optional[str] = None) -> str:
+    """Get the OAuth login URL for the specified provider."""
+    if provider not in [OAuthProvider.GOOGLE, OAuthProvider.FACEBOOK]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported OAuth provider: {provider}"
         )
-    ).delete()
-    db.commit()
-    
-    return None 
+
+    base_urls = {
+        OAuthProvider.GOOGLE: "https://accounts.google.com/o/oauth2/v2/auth",
+        OAuthProvider.FACEBOOK: "https://www.facebook.com/v12.0/dialog/oauth"
+    }
+
+    client_ids = {
+        OAuthProvider.GOOGLE: settings.GOOGLE_CLIENT_ID,
+        OAuthProvider.FACEBOOK: settings.FACEBOOK_CLIENT_ID
+    }
+
+    scopes = {
+        OAuthProvider.GOOGLE: ["openid", "email", "profile"],
+        OAuthProvider.FACEBOOK: ["email", "public_profile"]
+    }
+
+    params = {
+        "client_id": client_ids[provider],
+        "redirect_uri": redirect_uri or settings.OAUTH_REDIRECT_URL,
+        "response_type": "code",
+        "scope": " ".join(scopes[provider]),
+        "state": state
+    }
+
+    return f"{base_urls[provider]}?{urlencode(params)}" 

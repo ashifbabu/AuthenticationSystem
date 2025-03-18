@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.endpoints import auth, users
 from app.core.config import settings
 from app.core.middleware import add_middlewares
+from app.db.init_db import init_db
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -13,6 +14,9 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+# Initialize database tables
+init_db()
 
 # Set up CORS middleware
 app.add_middleware(

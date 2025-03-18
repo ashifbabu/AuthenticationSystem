@@ -1,8 +1,12 @@
 from typing import Any
-from sqlalchemy.ext.declarative import declarative_base, declared_attr
+from sqlalchemy.ext.declarative import as_declarative, declared_attr
+from sqlalchemy.orm import declarative_base
 
 
 class CustomBase:
+    id: Any
+    __name__: str
+
     # Generate __tablename__ automatically based on class name
     @declared_attr
     def __tablename__(cls) -> str:
