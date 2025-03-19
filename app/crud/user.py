@@ -12,7 +12,7 @@ import base64
 
 from app.core.security import get_password_hash, verify_password
 from app.models.user import User
-from app.models.token import VerificationToken, TokenType
+from app.models.token import VerificationToken, TokenType, PasswordResetToken
 from app.schemas.user import UserCreate, UserUpdate
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -203,4 +203,61 @@ def create_verification_token(
     db.add(db_token)
     db.commit()
     db.refresh(db_token)
-    return db_token 
+    return db_token
+
+
+def verify_email(db: Session, token: str) -> Optional[User]:
+    """Verify user's email using a verification token."""
+    # Get the verification token
+    verification_token = db.query(VerificationToken).filter(
+        and_(
+            VerificationToken.token == token,
+            VerificationToken.token_type == TokenType.EMAIL_VERIFICATION,
+            VerificationToken.expires_at > datetime.utcnow(),
+            VerificationToken.is_revoked == False
+        )
+    ).first()
+
+    if not verification_token:
+        return None
+
+    # Get the user
+    user = get_by_id(db, id=verification_token.user_id)
+    if not user:
+        return None
+
+    # Mark the token as revoked
+    verification_token.is_revoked = True
+    db.add(verification_token)
+
+    # Set user's email as verified
+    user = set_email_verified(db, user=user)
+
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def reset_password(db: Session, token: str, new_password: str) -> Optional[User]:
+    """Reset user's password using a reset token."""
+    # Get the verification token
+    db_token = db.query(PasswordResetToken).filter(
+        PasswordResetToken.token == token,
+        PasswordResetToken.is_revoked == False,
+        PasswordResetToken.expires_at > datetime.utcnow()
+    ).first()
+    
+    if not db_token:
+        return None
+        
+    # Get the user
+    user = db.query(User).filter(User.id == db_token.user_id).first()
+    if not user:
+        return None
+        
+    # Update password and mark token as revoked
+    user.hashed_password = get_password_hash(new_password)
+    db_token.is_revoked = True
+    db.commit()
+    db.refresh(user)
+    return user 

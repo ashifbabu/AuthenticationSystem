@@ -77,3 +77,13 @@ class OAuthStateToken(Token):
     
     # Specify relationship back to User model
     user = relationship("User", back_populates="oauth_state_tokens", overlaps="tokens")
+
+
+class PasswordResetToken(Token):
+    """Password reset token model for type discrimination."""
+    __mapper_args__ = {
+        'polymorphic_identity': TokenType.PASSWORD_RESET
+    }
+    
+    # Specify relationship back to User model
+    user = relationship("User", back_populates="password_reset_tokens", overlaps="tokens")

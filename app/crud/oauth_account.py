@@ -48,7 +48,8 @@ class CRUDOAuthAccount(CRUDBase[OAuthAccount, OAuthAccountCreate, OAuthAccountUp
             access_token=obj_in.access_token,
             refresh_token=obj_in.refresh_token,
             expires_at=obj_in.expires_at,
-            is_active=obj_in.is_active
+            is_active=obj_in.is_active,
+            raw_data=obj_in.raw_data or {}
         )
         db.add(db_obj)
         db.commit()

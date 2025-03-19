@@ -24,7 +24,7 @@ class OAuthUserInfo(BaseModel):
     email: str
     first_name: Optional[str] = None
     last_name: Optional[str] = None
-    raw_data: dict
+    raw_data: Dict[str, Any] = Field(default_factory=dict)
 
 
 class OAuthAccountBase(BaseModel):
@@ -35,6 +35,7 @@ class OAuthAccountBase(BaseModel):
     refresh_token: Optional[str] = None
     expires_at: Optional[datetime] = None
     is_active: bool = True
+    raw_data: Dict[str, Any] = Field(default_factory=dict)
 
 
 class OAuthAccountCreate(OAuthAccountBase):
@@ -46,6 +47,7 @@ class OAuthAccountUpdate(BaseModel):
     refresh_token: Optional[str] = None
     expires_at: Optional[datetime] = None
     is_active: Optional[bool] = None
+    raw_data: Optional[Dict[str, Any]] = None
 
 
 class OAuthAccount(OAuthAccountBase):

@@ -49,4 +49,5 @@ class User(Base):
     access_tokens = relationship("AccessToken", back_populates="user", cascade="all, delete-orphan", overlaps="tokens")
     refresh_tokens = relationship("RefreshToken", back_populates="user", cascade="all, delete-orphan", overlaps="tokens")
     verification_tokens = relationship("VerificationToken", back_populates="user", cascade="all, delete-orphan", overlaps="tokens")
-    oauth_state_tokens = relationship("OAuthStateToken", back_populates="user", cascade="all, delete-orphan", overlaps="tokens") 
+    oauth_state_tokens = relationship("OAuthStateToken", back_populates="user", cascade="all, delete-orphan", overlaps="tokens")
+    password_reset_tokens = relationship("PasswordResetToken", back_populates="user", cascade="all, delete-orphan", overlaps="tokens") 

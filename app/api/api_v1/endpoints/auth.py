@@ -19,7 +19,15 @@ from app.core.security import (
     verify_password,
     get_password_hash,
 )
-from app.schemas.user import UserCreate, UserUpdate
+from app.schemas.user import (
+    UserCreate,
+    UserUpdate,
+    UserResponse,
+    ChangePasswordRequest,
+    MFAVerifyRequest,
+    MFADisableRequest,
+    User,
+)
 from app.schemas.token import Token, RefreshToken
 from app.core.config import settings
 from app.schemas.oauth import OAuthProvider, OAuthUserInfo, OAuthAccountCreate, OAuthAccountUpdate
@@ -36,7 +44,7 @@ def authenticate_user(db: Session, email: str, password: str) -> Optional[User]:
         return None
     return user
 
-@router.post("/register", response_model=UserCreate)
+@router.post("/register", response_model=User)
 def register(user_in: UserCreate, db: Session = Depends(get_db)):
     """Register a new user."""
     if user_crud.get_by_email(db, email=user_in.email):
@@ -114,7 +122,11 @@ def verify_email(token: str, db: Session = Depends(get_db)):
             status_code=400,
             detail="Invalid or expired verification token"
         )
-    return {"message": "Email verified successfully"}
+    return {
+        "email": user.email,
+        "is_email_verified": user.is_email_verified,
+        "message": "Email verified successfully"
+    }
 
 @router.post("/refresh", response_model=Token)
 def refresh_token(
@@ -194,6 +206,7 @@ def forgot_password(email: str, db: Session = Depends(get_db)):
         token = user_crud.create_verification_token(
             db,
             user_id=user.id,
+            token=str(uuid4()),
             token_type=TokenType.PASSWORD_RESET,
             expires_delta=timedelta(hours=24)
         )
@@ -220,13 +233,12 @@ def reset_password(
 
 @router.put("/change-password")
 def change_password(
-    current_password: str,
-    new_password: str,
+    request: ChangePasswordRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Change user's password."""
-    if not verify_password(current_password, current_user.hashed_password):
+    if not verify_password(request.current_password, current_user.hashed_password):
         raise HTTPException(
             status_code=400,
             detail="Incorrect password"
@@ -234,7 +246,7 @@ def change_password(
     user_crud.update(
         db,
         db_obj=current_user,
-        obj_in={"hashed_password": get_password_hash(new_password)}
+        obj_in={"hashed_password": get_password_hash(request.new_password)}
     )
     return {"message": "Password changed successfully"}
 
@@ -300,7 +312,7 @@ def enable_mfa(
 
 @router.post("/mfa/verify")
 def verify_mfa(
-    code: str,
+    request: MFAVerifyRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -311,7 +323,7 @@ def verify_mfa(
             detail="MFA is not enabled"
         )
     
-    if not user_crud.verify_mfa_code(db, user=current_user, code=code):
+    if not user_crud.verify_mfa_code(db, user=current_user, code=request.code):
         raise HTTPException(
             status_code=400,
             detail="Invalid MFA code"
@@ -321,7 +333,7 @@ def verify_mfa(
 
 @router.post("/mfa/disable")
 def disable_mfa(
-    password: str,
+    request: MFADisableRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -332,7 +344,7 @@ def disable_mfa(
             detail="MFA is not enabled"
         )
     
-    if not verify_password(password, current_user.hashed_password):
+    if not verify_password(request.password, current_user.hashed_password):
         raise HTTPException(
             status_code=400,
             detail="Incorrect password"
