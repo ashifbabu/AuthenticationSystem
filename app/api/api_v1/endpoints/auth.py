@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Response
+from fastapi import APIRouter, Depends, HTTPException, status, Response, Query
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from datetime import timedelta, datetime
@@ -360,30 +360,28 @@ def disable_mfa(
 @router.get("/oauth/{provider}/login")
 async def oauth_login(
     provider: OAuthProvider,
+    redirect_uri: str = Query(..., description="The URL to redirect to after OAuth login"),
     db: Session = Depends(get_db)
 ) -> RedirectResponse:
     """OAuth login endpoint."""
     # Generate state token
     state = secrets.token_urlsafe(32)
     
-    # Store state token in database
-    token = OAuthStateToken(
-        id=str(uuid4()),
+    # Store state token in database using create_verification_token
+    token = token_crud.create_verification_token(
+        db=db,
         user_id=None,  # No user associated yet
         token=state,
         token_type=TokenType.OAUTH_STATE,
-        expires_at=datetime.utcnow() + timedelta(minutes=10),  # State token expires in 10 minutes
-        created_at=datetime.utcnow(),
-        is_revoked=False
+        expires_delta=timedelta(minutes=10),  # State token expires in 10 minutes
+        provider=provider,  # Set the provider
+        redirect_uri=redirect_uri  # Set the redirect_uri
     )
-    db.add(token)
-    db.commit()
-    db.refresh(token)
     
     # Get OAuth login URL
     login_url = await get_oauth_login_url(
         provider=provider,
-        redirect_uri=settings.OAUTH_REDIRECT_URI,
+        redirect_uri=redirect_uri,
         state=state
     )
     
@@ -408,6 +406,19 @@ async def oauth_callback(
             detail="Invalid state token"
         )
     
+    # Verify provider and redirect URI match what was stored in state token
+    if state_token.provider != provider:
+        raise HTTPException(
+            status_code=400,
+            detail="Provider mismatch"
+        )
+    
+    if state_token.redirect_uri != redirect_uri:
+        raise HTTPException(
+            status_code=400,
+            detail="Redirect URI mismatch"
+        )
+    
     # Exchange code for token
     token_data = await exchange_code_for_token(
         provider=provider,
@@ -418,7 +429,7 @@ async def oauth_callback(
     # Get user info from provider
     user_info = await get_user_info(
         provider=provider,
-        access_token=token_data["access_token"]
+        access_token=token_data["access_token"]  # Pass just the access token
     )
     
     # Find or create user
@@ -461,8 +472,14 @@ async def oauth_callback(
                 )
             )
         else:
-            # Create new user with random password
-            password = secrets.token_urlsafe(32)
+            # Create new user with a strong random password
+            # Generate a password that meets the requirements:
+            # - At least 8 characters
+            # - At least one uppercase letter
+            # - At least one lowercase letter
+            # - At least one digit
+            # - At least one special character
+            password = f"Oauth2{secrets.token_urlsafe(16)}#"  # This will always meet the requirements
             user = user_crud.create(
                 db,
                 obj_in=UserCreate(
@@ -474,7 +491,7 @@ async def oauth_callback(
                     is_email_verified=True  # Email is verified through OAuth
                 )
             )
-            # Create OAuth account
+            # Create OAuth account for new user
             oauth_crud.create(
                 db,
                 obj_in=OAuthAccountCreate(
@@ -492,12 +509,13 @@ async def oauth_callback(
     
     # Create access and refresh tokens
     access_token = create_access_token(
-        data={"sub": str(user.id)},
+        subject=user.id,
         expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     )
+    
     refresh_token = create_refresh_token(
-        data={"sub": str(user.id)},
-        expires_delta=timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+        subject=user.id,
+        expires_delta=timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES)
     )
     
     # Store refresh token in database
@@ -505,11 +523,11 @@ async def oauth_callback(
         db=db,
         user_id=user.id,
         token=refresh_token,
-        expires_delta=timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+        expires_delta=timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES)
     )
     
     # Revoke state token
-    token_crud.revoke_token(db, state_token.id)
+    token_crud.revoke_token(db, state_token.token)
     
     return {
         "access_token": access_token,

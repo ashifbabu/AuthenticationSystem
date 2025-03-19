@@ -12,7 +12,8 @@ import base64
 
 from app.core.security import get_password_hash, verify_password
 from app.models.user import User
-from app.models.token import VerificationToken, TokenType, PasswordResetToken
+from app.models.token import Token, TokenType, VerificationToken, PasswordResetToken
+from app.models.oauth import OAuthAccount
 from app.schemas.user import UserCreate, UserUpdate
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -117,10 +118,21 @@ def toggle_mfa(db: Session, *, user: User, enable: bool) -> User:
 
 
 def delete(db: Session, *, user_id: str) -> None:
+    """Delete a user."""
     user = db.query(User).filter(User.id == user_id).first()
     if user:
+        # Delete all tokens first
+        db.query(Token).filter(Token.user_id == user_id).delete()
+        # Delete all OAuth accounts
+        db.query(OAuthAccount).filter(OAuthAccount.user_id == user_id).delete()
+        # Delete the user
         db.delete(user)
         db.commit()
+
+
+def remove(db: Session, *, id: str) -> None:
+    """Remove a user by ID."""
+    return delete(db, user_id=id)
 
 
 def is_active(user: User) -> bool:
@@ -198,7 +210,8 @@ def create_verification_token(
         user_id=user_id,
         token=token,
         token_type=token_type,
-        expires_at=datetime.utcnow() + expires_delta
+        expires_at=datetime.utcnow() + expires_delta,
+        created_at=datetime.utcnow()
     )
     db.add(db_token)
     db.commit()

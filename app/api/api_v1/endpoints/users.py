@@ -2,15 +2,15 @@ from fastapi import APIRouter, Depends, HTTPException, status, Response
 from sqlalchemy.orm import Session
 from typing import Any, List
 
-from app.api.deps import get_db, get_current_user
+from app.api.deps import get_db, get_current_user, get_current_active_user, get_current_verified_user
 from app.crud import user as user_crud
 from app.crud.oauth_account import oauth_crud
 from app.models.user import User
 from app.schemas.user import UserUpdate, User as UserSchema
-from app.schemas.oauth_account import OAuthAccount as OAuthAccountSchema
+from app.schemas.oauth import OAuthAccount
 from app.schemas.message import Message
 from app.core.security import verify_password
-from app.schemas.oauth import OAuthAccount, OAuthProvider
+from app.core.enums import OAuthProvider
 
 router = APIRouter()
 
@@ -59,7 +59,7 @@ def delete_account(
 
 @router.get("/me/oauth-accounts", response_model=List[OAuthAccount])
 def read_oauth_accounts(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_verified_user),
     db: Session = Depends(get_db),
 ) -> Any:
     """Get current user's OAuth accounts."""
@@ -79,7 +79,7 @@ async def delete_oauth_account(
         if not oauth_account:
             raise HTTPException(status_code=404, detail="OAuth account not found")
         
-        oauth_crud.delete(db=db, id=oauth_account.id)
+        oauth_crud.remove(db=db, id=oauth_account.id)
         return {"message": "OAuth account deleted successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) 

@@ -8,6 +8,7 @@ from sqlalchemy import and_
 from app.models.token import AccessToken, RefreshToken, TokenType, VerificationToken, Token, OAuthStateToken
 from app.models.user import User
 from app.core.security import get_password_hash
+from app.core.enums import OAuthProvider
 
 
 def create_verification_token(
@@ -16,6 +17,8 @@ def create_verification_token(
     token: str,
     token_type: TokenType,
     expires_delta: timedelta,
+    provider: Optional[OAuthProvider] = None,
+    redirect_uri: Optional[str] = None,
 ) -> Token:
     """Create a verification token."""
     expires_at = datetime.utcnow() + expires_delta
@@ -28,13 +31,23 @@ def create_verification_token(
         TokenType.OAUTH_STATE: OAuthStateToken,
     }.get(token_type, Token)
     
-    db_obj = token_class(
-        user_id=user_id,
-        token=token,  # We're not hashing verification tokens in this implementation
-        token_type=token_type,
-        expires_at=expires_at,
-        created_at=datetime.utcnow(),
-    )
+    # Create token object with common fields
+    token_data = {
+        "user_id": user_id,
+        "token": token,  # We're not hashing verification tokens in this implementation
+        "token_type": token_type,
+        "expires_at": expires_at,
+        "created_at": datetime.utcnow(),
+    }
+    
+    # Add OAuth-specific fields if this is an OAuth state token
+    if token_type == TokenType.OAUTH_STATE:
+        token_data.update({
+            "provider": provider,
+            "redirect_uri": redirect_uri,
+        })
+    
+    db_obj = token_class(**token_data)
     
     db.add(db_obj)
     db.commit()
@@ -126,11 +139,23 @@ def verify_token(
     return db_obj
 
 
-def revoke_token(db: Session, token: str) -> bool:
-    """Revoke a token."""
+def revoke_token(db: Session, token_id: str = None, token: str = None) -> bool:
+    """Revoke a token by its ID or token string."""
+    # Use token_id if provided, otherwise use token
+    token_value = token_id or token
+    if not token_value:
+        return False
+
+    # Try to find token by ID first
     db_obj = db.query(Token).filter(
-        Token.token == token,
+        Token.id == token_value
     ).first()
+    
+    # If not found by ID, try to find by token string
+    if not db_obj:
+        db_obj = db.query(Token).filter(
+            Token.token == token_value
+        ).first()
     
     if not db_obj:
         return False

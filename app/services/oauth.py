@@ -185,26 +185,20 @@ async def get_user_info(provider: OAuthProvider, token_data: Dict) -> OAuthUserI
     if provider == OAuthProvider.GOOGLE:
         return OAuthUserInfo(
             provider=provider,
-            provider_user_id=user_data["sub"],
+            account_id=user_data["sub"],
             email=user_data["email"],
             first_name=user_data.get("given_name"),
             last_name=user_data.get("family_name"),
-            picture_url=user_data.get("picture"),
-            gender=user_data.get("gender"),
-            date_of_birth=user_data.get("birthdate"),
-            raw_data=user_data,
+            raw_data=user_data
         )
     elif provider == OAuthProvider.FACEBOOK:
         return OAuthUserInfo(
             provider=provider,
-            provider_user_id=user_data["id"],
+            account_id=user_data["id"],
             email=user_data.get("email", ""),  # Facebook might not return email if not public
             first_name=user_data.get("first_name"),
             last_name=user_data.get("last_name"),
-            picture_url=user_data.get("picture", {}).get("data", {}).get("url") if "picture" in user_data else None,
-            gender=user_data.get("gender"),
-            date_of_birth=user_data.get("birthday"),  # Facebook returns birthday in MM/DD/YYYY format
-            raw_data=user_data,
+            raw_data=user_data
         )
     elif provider == OAuthProvider.GITHUB:
         # Get email from GitHub's email endpoint
@@ -226,21 +220,19 @@ async def get_user_info(provider: OAuthProvider, token_data: Dict) -> OAuthUserI
         
         return OAuthUserInfo(
             provider=provider,
-            provider_user_id=str(user_data["id"]),
+            account_id=str(user_data["id"]),
             email=primary_email,
             first_name=first_name,
             last_name=last_name,
-            picture_url=user_data.get("avatar_url"),
-            raw_data=user_data,
+            raw_data=user_data
         )
     elif provider == OAuthProvider.LINKEDIN:
         return OAuthUserInfo(
             provider=provider,
-            provider_user_id=user_data["id"],
+            account_id=user_data["id"],
             email=user_data.get("emailAddress", ""),
             first_name=user_data.get("localizedFirstName"),
             last_name=user_data.get("localizedLastName"),
-            picture_url=user_data.get("profilePicture", {}).get("displayImage"),
             raw_data=user_data,
         )
     elif provider == OAuthProvider.TWITTER:
@@ -251,11 +243,10 @@ async def get_user_info(provider: OAuthProvider, token_data: Dict) -> OAuthUserI
         
         return OAuthUserInfo(
             provider=provider,
-            provider_user_id=user_data["data"]["id"],
+            account_id=user_data["data"]["id"],
             email=user_data.get("data", {}).get("email", ""),
             first_name=first_name,
             last_name=last_name,
-            picture_url=user_data.get("data", {}).get("profile_image_url"),
             raw_data=user_data,
         )
     
