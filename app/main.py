@@ -1,10 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.endpoints import auth, users
+from app.api.api_v1.api import api_router
 from app.core.config import settings
 from app.core.middleware import add_middlewares
 from app.db.init_db import init_db
+from app.db.session import SessionLocal
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -16,7 +17,11 @@ app = FastAPI(
 )
 
 # Initialize database tables
-init_db()
+db = SessionLocal()
+try:
+    init_db(db)
+finally:
+    db.close()
 
 # Set up CORS middleware
 app.add_middleware(
@@ -30,9 +35,8 @@ app.add_middleware(
 # Add custom middlewares (rate limiting, CSRF protection)
 add_middlewares(app)
 
-# Include routers
-app.include_router(auth.router, prefix=settings.API_V1_STR)
-app.include_router(users.router, prefix=settings.API_V1_STR)
+# Include API router
+app.include_router(api_router, prefix=settings.API_V1_STR)
 
 @app.get("/")
 async def root():

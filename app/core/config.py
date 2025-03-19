@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     VERSION: str = "1.0.0"
     
     # SECURITY
-    SECRET_KEY: str = "your-secret-key"
+    SECRET_KEY: str = secrets.token_urlsafe(32)
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
     ALGORITHM: str = "HS256"
@@ -29,7 +29,7 @@ class Settings(BaseSettings):
         raise ValueError(v)
 
     # DATABASE
-    SQLALCHEMY_DATABASE_URL: str = "sqlite:///./test.db"
+    SQLALCHEMY_DATABASE_URL: str = "sqlite:///:memory:"
 
     # EMAIL
     EMAILS_ENABLED: bool = False
@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     TWITTER_CLIENT_SECRET: str = "test-twitter-client-secret"
     OAUTH_REDIRECT_URL: str = "http://localhost:8000/api/v1/auth/oauth/callback"
     FRONTEND_URL: str = "http://localhost:3000"
+    OAUTH_REDIRECT_URI: str = "http://localhost:3000/oauth/callback"
 
     # OAuth provider settings
     OAUTH_PROVIDERS: List[str] = ["google", "facebook", "github", "linkedin", "twitter"]
@@ -69,7 +70,11 @@ class Settings(BaseSettings):
     ALLOW_REGISTRATION: bool = True
     PASSWORD_MIN_LENGTH: int = 8
     PASSWORD_MAX_LENGTH: int = 50
-    PASSWORD_REGEX: str = r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]+$"
+    PASSWORD_REGEX: str = r"^(?=.*[A-Za-z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]+$"
+
+    # Superuser
+    FIRST_SUPERUSER_EMAIL: str = "admin@example.com"
+    FIRST_SUPERUSER_PASSWORD: str = "Admin123!@#"
 
     model_config = {
         "case_sensitive": True,

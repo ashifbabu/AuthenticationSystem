@@ -15,6 +15,7 @@ class TokenType(str, Enum):
     EMAIL_VERIFICATION = "email_verification"
     PASSWORD_RESET = "password_reset"
     MFA = "mfa"
+    OAUTH_STATE = "oauth_state"
 
 
 class Token(Base):
@@ -30,7 +31,7 @@ class Token(Base):
     is_revoked = Column(Boolean, default=False)
     
     # Relationship to User model
-    user = relationship("User", back_populates="tokens", overlaps="access_tokens,refresh_tokens,verification_tokens")
+    user = relationship("User", back_populates="tokens", overlaps="access_tokens,refresh_tokens,verification_tokens,oauth_state_tokens")
 
     __mapper_args__ = {
         'polymorphic_on': token_type,
@@ -65,4 +66,14 @@ class VerificationToken(Token):
     }
     
     # Specify relationship back to User model
-    user = relationship("User", back_populates="verification_tokens", overlaps="tokens") 
+    user = relationship("User", back_populates="verification_tokens", overlaps="tokens")
+
+
+class OAuthStateToken(Token):
+    """OAuth state token model for type discrimination."""
+    __mapper_args__ = {
+        'polymorphic_identity': TokenType.OAUTH_STATE
+    }
+    
+    # Specify relationship back to User model
+    user = relationship("User", back_populates="oauth_state_tokens", overlaps="tokens")

@@ -1,43 +1,87 @@
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import StaticPool
 from datetime import datetime, timedelta, date
-from sqlalchemy import text
 from unittest.mock import patch, AsyncMock
+from uuid import uuid4
+import secrets
 
 from app.main import app
 from app.core.config import settings
 from app.models.user import User
 from app.models.token import Token, TokenType
+from app.models.oauth import OAuthAccount
 from app.crud import user as user_crud
 from app.crud import token as token_crud
-from app.core.security import create_access_token, create_refresh_token
+from app.crud import oauth as oauth_crud
+from app.core.security import create_access_token, create_refresh_token, get_password_hash
 from app.schemas.user import UserCreate, Gender
 from app.core.enums import OAuthProvider
 from app.schemas.oauth import OAuthUserInfo
 from app.db.base_class import Base
-from app.db.session import engine, SessionLocal
-from datetime import datetime, timedelta
-from uuid import uuid4
+from app.db.session import SessionLocal, get_db
+from app.db.init_db import init_db
+from app.models.token import OAuthStateToken
 
-@pytest.fixture(scope="module")
-def client():
-    from fastapi.testclient import TestClient
-    from app.main import app
+@pytest.fixture(scope="session")
+def db_engine():
+    """Create a test database engine."""
+    # Use in-memory SQLite for tests
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool
+    )
     
+    # Create all tables
+    Base.metadata.create_all(bind=engine)
+    
+    return engine
+
+@pytest.fixture(scope="function")
+def db(db_engine):
+    """Get a database session for testing."""
+    connection = db_engine.connect()
+    transaction = connection.begin()
+    session = Session(bind=connection)
+    
+    # Initialize database with required data
+    init_db(session)
+    
+    yield session
+    
+    # Rollback the transaction
+    transaction.rollback()
+    connection.close()
+
+@pytest.fixture(scope="function")
+def client(db):
+    """Create a test client with a fresh database."""
+    app.dependency_overrides[get_db] = lambda: db
+
     client = TestClient(app)
-    
-    # Get CSRF token
-    response = client.get("/api/v1/auth/csrf-token")
-    csrf_token = response.json()["csrf_token"]
-    
-    # Set CSRF token in headers for all requests
+
+    # Generate a CSRF token
+    csrf_token = secrets.token_urlsafe(32)
+
+    # Set CSRF token in headers and cookies for all requests
     client.headers.update({
         "X-CSRF-Token": csrf_token,
         "Content-Type": "application/json"
     })
-    
-    return client
+    client.cookies.update({
+        "csrf_token": csrf_token
+    })
+
+    # Create a new client with the updated headers and cookies
+    client = TestClient(app, headers=client.headers, cookies=client.cookies)
+
+    yield client
+
+    # Clean up
+    app.dependency_overrides.clear()
 
 # Test data
 test_user_dict = {
@@ -64,6 +108,7 @@ test_user_data = UserCreate(
 
 @pytest.fixture
 def test_user(db: Session):
+    """Create a test user if it doesn't exist."""
     # First check if user already exists
     user = user_crud.get_by_email(db, email=test_user_data.email)
     if not user:
@@ -77,15 +122,13 @@ def test_user(db: Session):
     if not user.is_active:
         user = user_crud.update(db, db_obj=user, obj_in={"is_active": True})
     
+    # Refresh the user object to get the latest state
+    db.refresh(user)
     return user
 
 @pytest.fixture
 def test_user_token(test_user: User, db: Session):
     """Create access and refresh tokens for test user."""
-    from app.models.token import Token, TokenType
-    from datetime import datetime, timedelta
-    from uuid import uuid4
-    
     # Create access token
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
@@ -129,30 +172,13 @@ def test_user_token(test_user: User, db: Session):
     }
 
 @pytest.fixture(autouse=True)
-def cleanup_database():
+def cleanup_database(db: Session):
     """Clean up the database before each test."""
-    from app.db.base import Base
-    from app.db.session import engine, SessionLocal
-    from sqlalchemy import text
-    
-    # Drop and recreate all tables
-    Base.metadata.drop_all(bind=engine)
-    Base.metadata.create_all(bind=engine)
-    
-    # Create a new session and delete all data
-    db = SessionLocal()
-    try:
-        # Delete all data from tables in reverse order of dependencies
-        db.execute(text("DELETE FROM tokens"))
-        db.execute(text("DELETE FROM oauth_accounts"))
-        db.execute(text("DELETE FROM login_attempts"))
-        db.execute(text("DELETE FROM users"))
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        raise e
-    finally:
-        db.close()
+    # Delete all data from tables in reverse order of dependencies
+    db.execute(text("DELETE FROM oauth_accounts"))
+    db.execute(text("DELETE FROM tokens"))
+    db.execute(text("DELETE FROM users"))
+    db.commit()
 
 # Health Check Tests
 def test_health_check(client):
@@ -322,76 +348,146 @@ def test_disable_mfa(client, test_user_token: dict):
     assert response.status_code == 200
 
 # OAuth Tests
-@pytest.mark.asyncio
-async def test_oauth_login(client):
-    mock_url = "https://example.com/oauth"
-    mock_state = "test_state"
-    with patch("app.services.oauth.generate_oauth_state", return_value=mock_state), \
-         patch("app.services.oauth.get_oauth_login_url", return_value=mock_url):
-        response = client.post(
-            "/api/v1/auth/oauth/google/login",
-            json={
-                "redirect_uri": "http://localhost:8000/callback",
-                "state": mock_state
-            }
-        )
-        assert response.status_code == 302
-        assert response.headers["location"] == mock_url
+def test_oauth_login(client: TestClient):
+    """Test OAuth login endpoint."""
+    response = client.get(
+        "/api/v1/auth/oauth/google/login",
+        params={
+            "redirect_uri": "http://localhost:3000/oauth/callback"
+        },
+        allow_redirects=False
+    )
+    assert response.status_code == 307  # Temporary redirect
+    assert "accounts.google.com" in response.headers["location"]
 
-@pytest.mark.asyncio
-async def test_oauth_callback(client):
-    # Mock data
-    mock_token_data = {
-        "access_token": "mock_access_token",
-        "token_type": "bearer",
-        "expires_in": 3600,
-        "expires_at": datetime.utcnow() + timedelta(seconds=3600),
-        "refresh_token": "mock_refresh_token"
-    }
-    
-    mock_user_info = OAuthUserInfo(
-        provider=OAuthProvider.GOOGLE,
-        provider_user_id="mock_user_id",
-        email="test@example.com",
-        first_name="Test",
-        last_name="User",
-        picture_url="https://example.com/picture.jpg",
-        gender=None,
-        date_of_birth=None,
-        raw_data={}
+def test_oauth_callback(
+    client: TestClient,
+    test_oauth_state: str,
+    test_oauth_token_data: dict,
+    test_oauth_user_info: OAuthUserInfo,
+    monkeypatch
+):
+    """Test OAuth callback endpoint."""
+    # Mock OAuth token exchange
+    monkeypatch.setattr(
+        "app.core.oauth.exchange_code_for_token",
+        AsyncMock(return_value=test_oauth_token_data)
     )
 
-    # Set up mocks
-    async def mock_exchange(*args, **kwargs):
-        return mock_token_data
+    # Mock OAuth user info
+    monkeypatch.setattr(
+        "app.core.oauth.get_user_info",
+        AsyncMock(return_value=test_oauth_user_info)
+    )
 
-    async def mock_get_user_info(*args, **kwargs):
-        return mock_user_info
+    # Create a state token
+    state = secrets.token_urlsafe(32)
+    db = SessionLocal()
+    try:
+        token = OAuthStateToken(
+            id=str(uuid4()),
+            user_id=None,
+            token=state,
+            token_type=TokenType.OAUTH_STATE,
+            expires_at=datetime.utcnow() + timedelta(minutes=10),
+            created_at=datetime.utcnow(),
+            is_revoked=False
+        )
+        db.add(token)
+        db.commit()
+        db.refresh(token)
+    finally:
+        db.close()
 
-    with patch("app.services.oauth.exchange_code_for_token", new=mock_exchange), \
-         patch("app.services.oauth.get_user_info", new=mock_get_user_info), \
-         patch("app.crud.oauth_account.get_by_provider_and_user", return_value=None), \
-         patch("app.crud.user.get_by_email", return_value=None), \
-         patch("app.crud.oauth_account.create"), \
-         patch("app.core.security.create_access_token", return_value="mock_access_token"), \
-         patch("app.core.security.create_refresh_token", return_value="mock_refresh_token"), \
-         patch("app.crud.token.create_access_token"), \
-         patch("app.crud.token.create_refresh_token"):
+    response = client.get(
+        f"/api/v1/auth/oauth/callback/google",
+        params={
+            "code": "test_code",
+            "state": state,
+            "redirect_uri": "http://localhost:3000/oauth/callback"
+        }
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "access_token" in data
+    assert "refresh_token" in data
+    assert data["token_type"] == "bearer"
 
-        response = client.post(
-            "/api/v1/auth/oauth/google/callback",
-            json={
-                "code": "mock_code",
-                "state": "test_state",
-                "redirect_uri": "http://localhost:8000/callback"
+def test_oauth_account_crud(
+    client: TestClient,
+    test_user: User,
+    test_user_token: dict
+):
+    """Test OAuth account CRUD operations."""
+    # Create an OAuth account
+    db = SessionLocal()
+    try:
+        # Ensure test user exists
+        user = user_crud.get_by_email(db, email=test_user_dict["email"])
+        if not user:
+            user = user_crud.create(
+                db,
+                obj_in=UserCreate(
+                    email=test_user_dict["email"],
+                    password=test_user_dict["password"],
+                    confirm_password=test_user_dict["password"],
+                    first_name=test_user_dict["first_name"],
+                    last_name=test_user_dict["last_name"]
+                )
+            )
+        
+        # Create OAuth account
+        oauth_account = OAuthAccount(
+            id=str(uuid4()),
+            user_id=user.id,
+            provider=OAuthProvider.GOOGLE,
+            account_id="test_provider_user_id",
+            account_email="test@example.com",
+            access_token="test_access_token",
+            refresh_token="test_refresh_token",
+            expires_at=datetime.utcnow() + timedelta(hours=1),
+            is_active=True,
+            raw_data={
+                "sub": "test_provider_user_id",
+                "email": "test@example.com",
+                "given_name": "Test",
+                "family_name": "User"
             }
         )
-        
-        assert response.status_code == 200
-        data = response.json()
-        assert "access_token" in data
-        assert "refresh_token" in data
-        assert data["token_type"] == "bearer"
+        db.add(oauth_account)
+        db.commit()
+        db.refresh(oauth_account)
+    finally:
+        db.close()
+
+    # Get OAuth accounts
+    response = client.get(
+        "/api/v1/users/me/oauth-accounts",
+        headers={"Authorization": f"Bearer {test_user_token['access_token']}"}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) > 0
+    assert data[0]["provider"] == "google"
+    assert data[0]["account_id"] == "test_provider_user_id"
+    assert data[0]["account_email"] == "test@example.com"
+
+    # Delete OAuth account
+    response = client.delete(
+        f"/api/v1/users/me/oauth-accounts/google",
+        headers={"Authorization": f"Bearer {test_user_token['access_token']}"}
+    )
+    assert response.status_code == 200
+    assert response.json()["message"] == "OAuth account deleted successfully"
+
+    # Verify deletion
+    response = client.get(
+        "/api/v1/users/me/oauth-accounts",
+        headers={"Authorization": f"Bearer {test_user_token['access_token']}"}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) == 0
 
 # Account Status Tests
 def test_check_account_status(client, test_user_token: dict):
@@ -444,3 +540,316 @@ def test_delete_account(client, test_user_token: dict):
         headers={"Authorization": f"Bearer {test_user_token['access_token']}"}
     )
     assert response.status_code == 204
+
+def test_oauth_google_login(client):
+    """Test Google OAuth login endpoint."""
+    response = client.get(
+        "/api/v1/auth/oauth/google/login",
+        params={
+            "redirect_uri": "http://localhost:3000/oauth/callback",
+            "state": "test_state"
+        },
+        allow_redirects=False
+    )
+    assert response.status_code == 307  # Temporary redirect
+    assert "accounts.google.com" in response.headers["location"]
+
+def test_oauth_facebook_login(client):
+    """Test Facebook OAuth login endpoint."""
+    response = client.get(
+        "/api/v1/auth/oauth/facebook/login",
+        params={
+            "redirect_uri": "http://localhost:3000/oauth/callback",
+            "state": "test_state"
+        },
+        allow_redirects=False
+    )
+    assert response.status_code == 307  # Temporary redirect
+    assert "facebook.com" in response.headers["location"]
+
+def test_oauth_github_login(client):
+    """Test GitHub OAuth login endpoint."""
+    response = client.get(
+        "/api/v1/auth/oauth/github/login",
+        params={
+            "redirect_uri": "http://localhost:3000/oauth/callback",
+            "state": "test_state"
+        },
+        allow_redirects=False
+    )
+    assert response.status_code == 307  # Temporary redirect
+    assert "github.com" in response.headers["location"]
+
+@pytest.mark.asyncio
+async def test_oauth_callback_google(client, monkeypatch):
+    """Test Google OAuth callback endpoint."""
+    # Mock exchange_code_for_token
+    async def mock_exchange_code_for_token(*args, **kwargs):
+        return {
+            "access_token": "test_access_token",
+            "refresh_token": "test_refresh_token",
+            "expires_in": 3600
+        }
+    monkeypatch.setattr(
+        "app.core.oauth.exchange_code_for_token",
+        mock_exchange_code_for_token
+    )
+    
+    # Mock get_user_info
+    async def mock_get_user_info(*args, **kwargs):
+        return OAuthUserInfo(
+            provider=OAuthProvider.GOOGLE,
+            account_id="123",
+            email="test@example.com",
+            first_name="Test",
+            last_name="User",
+            raw_data={"sub": "123", "email": "test@example.com"}
+        )
+    monkeypatch.setattr(
+        "app.core.oauth.get_user_info",
+        mock_get_user_info
+    )
+    
+    # Create a state token
+    state = secrets.token_urlsafe(32)
+    db = SessionLocal()
+    try:
+        token = OAuthStateToken(
+            id=str(uuid4()),
+            user_id=None,
+            token=state,
+            token_type=TokenType.OAUTH_STATE,
+            expires_at=datetime.utcnow() + timedelta(minutes=10),
+            created_at=datetime.utcnow(),
+            is_revoked=False
+        )
+        db.add(token)
+        db.commit()
+        db.refresh(token)
+    finally:
+        db.close()
+    
+    response = client.get(
+        "/api/v1/auth/oauth/callback/google",
+        params={
+            "code": "test_code",
+            "state": state,
+            "redirect_uri": "http://localhost:3000/oauth/callback"
+        }
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "access_token" in data
+    assert "refresh_token" in data
+    assert data["token_type"] == "bearer"
+
+@pytest.mark.asyncio
+async def test_oauth_callback_facebook(client, monkeypatch):
+    """Test Facebook OAuth callback endpoint."""
+    # Mock exchange_code_for_token
+    async def mock_exchange_code_for_token(*args, **kwargs):
+        return {
+            "access_token": "test_access_token",
+            "expires_in": 3600
+        }
+    monkeypatch.setattr(
+        "app.core.oauth.exchange_code_for_token",
+        mock_exchange_code_for_token
+    )
+    
+    # Mock get_user_info
+    async def mock_get_user_info(*args, **kwargs):
+        return OAuthUserInfo(
+            provider=OAuthProvider.FACEBOOK,
+            account_id="123",
+            email="test@example.com",
+            first_name="Test",
+            last_name="User",
+            raw_data={"id": "123", "email": "test@example.com"}
+        )
+    monkeypatch.setattr(
+        "app.core.oauth.get_user_info",
+        mock_get_user_info
+    )
+    
+    # Create a state token
+    state = secrets.token_urlsafe(32)
+    db = SessionLocal()
+    try:
+        token = OAuthStateToken(
+            id=str(uuid4()),
+            user_id=None,
+            token=state,
+            token_type=TokenType.OAUTH_STATE,
+            expires_at=datetime.utcnow() + timedelta(minutes=10),
+            created_at=datetime.utcnow(),
+            is_revoked=False
+        )
+        db.add(token)
+        db.commit()
+        db.refresh(token)
+    finally:
+        db.close()
+    
+    response = client.get(
+        "/api/v1/auth/oauth/callback/facebook",
+        params={
+            "code": "test_code",
+            "state": state,
+            "redirect_uri": "http://localhost:3000/oauth/callback"
+        }
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "access_token" in data
+    assert "refresh_token" in data
+    assert data["token_type"] == "bearer"
+
+@pytest.mark.asyncio
+async def test_oauth_callback_github(client, monkeypatch):
+    """Test GitHub OAuth callback endpoint."""
+    # Mock exchange_code_for_token
+    async def mock_exchange_code_for_token(*args, **kwargs):
+        return {
+            "access_token": "test_access_token"
+        }
+    monkeypatch.setattr(
+        "app.core.oauth.exchange_code_for_token",
+        mock_exchange_code_for_token
+    )
+    
+    # Mock get_user_info
+    async def mock_get_user_info(*args, **kwargs):
+        return OAuthUserInfo(
+            provider=OAuthProvider.GITHUB,
+            account_id="123",
+            email="test@example.com",
+            first_name="Test",
+            last_name="User",
+            raw_data={
+                "profile": {"id": 123, "email": "test@example.com"},
+                "emails": [{"email": "test@example.com", "primary": True}]
+            }
+        )
+    monkeypatch.setattr(
+        "app.core.oauth.get_user_info",
+        mock_get_user_info
+    )
+    
+    # Create a state token
+    state = secrets.token_urlsafe(32)
+    db = SessionLocal()
+    try:
+        token = OAuthStateToken(
+            id=str(uuid4()),
+            user_id=None,
+            token=state,
+            token_type=TokenType.OAUTH_STATE,
+            expires_at=datetime.utcnow() + timedelta(minutes=10),
+            created_at=datetime.utcnow(),
+            is_revoked=False
+        )
+        db.add(token)
+        db.commit()
+        db.refresh(token)
+    finally:
+        db.close()
+    
+    response = client.get(
+        "/api/v1/auth/oauth/callback/github",
+        params={
+            "code": "test_code",
+            "state": state,
+            "redirect_uri": "http://localhost:3000/oauth/callback"
+        }
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "access_token" in data
+    assert "refresh_token" in data
+    assert data["token_type"] == "bearer"
+
+def test_get_oauth_accounts(client, test_user, test_user_token):
+    """Test getting OAuth accounts for the current user."""
+    response = client.get(
+        "/api/v1/users/me/oauth-accounts",
+        headers={"Authorization": f"Bearer {test_user_token}"}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert isinstance(data, list)
+
+def test_delete_oauth_account(client, test_user, test_user_token):
+    """Test deleting an OAuth account."""
+    response = client.delete(
+        "/api/v1/users/me/oauth-accounts/google",
+        headers={"Authorization": f"Bearer {test_user_token}"}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["message"] == "OAuth account deleted successfully"
+
+@pytest.fixture
+def test_oauth_state():
+    """Create a test OAuth state."""
+    return secrets.token_urlsafe(32)
+
+@pytest.fixture
+def test_oauth_token_data():
+    """Create test OAuth token data."""
+    return {
+        "access_token": "test_access_token",
+        "refresh_token": "test_refresh_token",
+        "expires_in": 3600,
+        "token_type": "bearer"
+    }
+
+@pytest.fixture
+def test_oauth_user_info():
+    """Create test OAuth user info."""
+    return OAuthUserInfo(
+        provider=OAuthProvider.GOOGLE,
+        account_id="test_provider_user_id",
+        email="test@example.com",
+        first_name="Test",
+        last_name="User",
+        raw_data={
+            "sub": "test_provider_user_id",
+            "email": "test@example.com",
+            "given_name": "Test",
+            "family_name": "User"
+        }
+    )
+
+@pytest.fixture
+def test_oauth_account(db: Session, test_user: User):
+    """Create a test OAuth account."""
+    oauth_account = OAuthAccount(
+        id=str(uuid4()),
+        user_id=test_user.id,
+        provider=OAuthProvider.GOOGLE,
+        account_id="test_provider_user_id",
+        account_email="test@example.com",
+        access_token="test_access_token",
+        refresh_token="test_refresh_token",
+        expires_at=datetime.utcnow() + timedelta(hours=1),
+        is_active=True,
+        raw_data={
+            "sub": "test_provider_user_id",
+            "email": "test@example.com",
+            "given_name": "Test",
+            "family_name": "User"
+        }
+    )
+    db.add(oauth_account)
+    db.commit()
+    db.refresh(oauth_account)
+    return oauth_account
+
+@pytest.fixture
+def test_token(test_user: User):
+    """Create a test access token."""
+    return create_access_token(
+        subject=test_user.id,
+        expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    )

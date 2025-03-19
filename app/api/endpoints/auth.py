@@ -6,7 +6,7 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, Body, Depends, HTTPException, status, Request, BackgroundTasks, Query
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.responses import RedirectResponse, JSONResponse
-from jose import jwt
+from jose import jwt, JWTError
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
@@ -18,7 +18,7 @@ from app.core.enums import OAuthProvider
 from app.models.user import User
 from app.models.token import TokenType
 from app.models.login_attempt import LoginAttempt
-from app.schemas.token import Token
+from app.schemas.token import Token, RefreshToken, VerificationToken, TokenPayload
 from app.schemas.user import UserCreate, UserUpdate, User as UserSchema, MFAResponse
 from app.schemas.password import PasswordChange, PasswordReset
 from app.db.session import get_db
@@ -41,9 +41,6 @@ from app.schemas.auth import (
     ResetPassword,
     VerifyEmail,
 )
-from app.schemas.token import RefreshToken, Token, VerificationToken
-from app.schemas.user import User as UserSchema, UserCreate, UserUpdate
-from app.services import email
 from app.schemas.oauth import OAuthCallback, OAuthRequest, OAuthUserInfo
 from app.schemas.password import PasswordReset, PasswordResetRequest
 from app.schemas.mfa import MFADisable, MFAResponse, MFAVerify
@@ -52,6 +49,12 @@ from app.services.oauth import (
     get_oauth_login_url,
     exchange_code_for_token,
     get_user_info,
+)
+from app.services.email import (
+    send_verification_email,
+    send_password_reset_email,
+    send_mfa_code_email,
+    send_security_notification_email,
 )
 from app.crud.user import (
     get_by_email,
@@ -78,6 +81,8 @@ from app.crud.oauth_account import (
 from app.crud.login_attempt import (
     create as create_login_attempt,
     count_recent_failed_attempts,
+    get_recent_attempts,
+    is_account_locked,
 )
 
 
@@ -130,7 +135,7 @@ def register_user(
     )
     
     # Send verification email
-    email.send_verification_email(user.email, token)
+    send_verification_email(user.email, token)
     
     return user
 
@@ -275,7 +280,7 @@ def refresh_token(
         )
     
     # Check if the token has been revoked
-    if not crud.token.get_token(db, token=refresh_token_in.refresh_token):
+    if not crud.token.get_token(db, token=refresh_token_in.refresh_token, token_type=TokenType.REFRESH):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token has been revoked",
@@ -339,7 +344,7 @@ def forgot_password(
         token = generate_password_reset_token()
         set_email_verified(db, user=user, token=token, token_type=TokenType.PASSWORD_RESET, expires_delta=timedelta(hours=24))
         background_tasks.add_task(
-            email.send_password_reset_email, user.email, token
+            send_password_reset_email, user.email, token
         )
     return None
 
@@ -385,7 +390,7 @@ def reset_password(
     
     # Send a security notification email
     background_tasks.add_task(
-        email.send_security_notification_email,
+        send_security_notification_email,
         email_to=user.email,
         event_type="password_change",
         details={
@@ -472,7 +477,7 @@ def enable_mfa(
     set_email_verified(db, user=current_user, token=mfa_code, token_type=TokenType.MFA, expires_delta=timedelta(minutes=10))
     
     # Send MFA code via email
-    email.send_mfa_code_email(current_user.email, mfa_code)
+    send_mfa_code_email(current_user.email, mfa_code)
     
     return {"mfa_enabled": True}
 
@@ -531,10 +536,11 @@ def disable_mfa(
     return {"mfa_enabled": False}
 
 
-@router.post("/oauth/{provider}/login")
+@router.get("/oauth/{provider}/login")
 def oauth_login(
     provider: str,
-    oauth_request: OAuthRequest,
+    redirect_uri: str = Query(..., description="The URL to redirect to after OAuth login"),
+    state: Optional[str] = Query(None, description="Optional state parameter for CSRF protection"),
     db: Session = Depends(get_db),
 ) -> Any:
     """
@@ -549,7 +555,7 @@ def oauth_login(
         )
     
     # Generate OAuth login URL with state
-    login_url = get_oauth_login_url(oauth_provider, oauth_request.redirect_uri, oauth_request.state)
+    login_url = get_oauth_login_url(oauth_provider, redirect_uri, state)
     
     # Return redirect response
     return RedirectResponse(url=login_url, status_code=status.HTTP_302_FOUND)
@@ -572,78 +578,86 @@ async def oauth_callback(
             detail=f"Unsupported OAuth provider: {provider}"
         )
     
-    # Exchange code for token
-    token_data = await exchange_code_for_token(oauth_provider, oauth_callback.code, oauth_callback.redirect_uri)
-    
-    # Get user info from provider
-    user_info = await get_user_info(oauth_provider, token_data)
-    
-    # Check if user already exists with this OAuth account
-    oauth_account = crud.oauth_account.get_by_provider_and_user(
-        db,
-        provider=oauth_provider,
-        provider_user_id=user_info.provider_user_id
-    )
-    
-    if oauth_account:
-        # Get existing user
-        user = crud.user.get(db, id=oauth_account.user_id)
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
-            )
-    else:
-        # Check if user exists with this email
-        user = crud.user.get_by_email(db, email=user_info.email)
-        if user:
-            # Link OAuth account to existing user
-            crud.oauth_account.create(
-                db,
-                user_id=user.id,
-                provider=oauth_provider,
-                provider_user_id=user_info.provider_user_id,
-                access_token=token_data["access_token"],
-                refresh_token=token_data.get("refresh_token"),
-                expires_at=token_data["expires_at"]
-            )
+    try:
+        # Exchange code for token
+        token_data = await exchange_code_for_token(oauth_provider, oauth_callback.code, oauth_callback.redirect_uri)
+        
+        # Get user info from provider
+        user_info = await get_user_info(oauth_provider, token_data)
+        
+        # Check if user already exists with this OAuth account
+        oauth_account = crud.oauth_account.get_by_provider_and_user(
+            db,
+            provider=oauth_provider,
+            provider_user_id=user_info.provider_user_id
+        )
+        
+        if oauth_account:
+            # Get existing user
+            user = crud.user.get(db, id=oauth_account.user_id)
+            if not user:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="User not found"
+                )
         else:
-            # Create new user
-            user_in = UserCreate(
-                email=user_info.email,
-                first_name=user_info.first_name,
-                last_name=user_info.last_name,
-                is_active=True,
-                is_email_verified=True,  # OAuth emails are pre-verified
-                gender=user_info.gender,
-                date_of_birth=user_info.date_of_birth
-            )
-            user = crud.user.create(db, obj_in=user_in)
-            
-            # Create OAuth account
-            crud.oauth_account.create(
-                db,
-                user_id=user.id,
-                provider=oauth_provider,
-                provider_user_id=user_info.provider_user_id,
-                access_token=token_data["access_token"],
-                refresh_token=token_data.get("refresh_token"),
-                expires_at=token_data["expires_at"]
-            )
-    
-    # Create access and refresh tokens
-    access_token = create_access_token(subject=user.id)
-    refresh_token = create_refresh_token(user_id=user.id)
-    
-    # Store tokens in the database
-    crud.token.create_access_token(db, user_id=user.id, token=access_token)
-    crud.token.create_refresh_token(db, user_id=user.id, token=refresh_token)
-    
-    return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer"
-    }
+            # Check if user exists with this email
+            user = crud.user.get_by_email(db, email=user_info.email)
+            if user:
+                # Link OAuth account to existing user
+                crud.oauth_account.create(
+                    db,
+                    user_id=user.id,
+                    provider=oauth_provider,
+                    provider_user_id=user_info.provider_user_id,
+                    access_token=token_data["access_token"],
+                    refresh_token=token_data.get("refresh_token"),
+                    expires_at=token_data["expires_at"]
+                )
+            else:
+                # Create new user
+                user_in = UserCreate(
+                    email=user_info.email,
+                    first_name=user_info.first_name,
+                    last_name=user_info.last_name,
+                    is_active=True,
+                    is_email_verified=True,  # OAuth emails are pre-verified
+                    gender=user_info.gender,
+                    date_of_birth=user_info.date_of_birth,
+                    password=secrets.token_urlsafe(32),  # Generate a random password
+                    confirm_password=secrets.token_urlsafe(32)  # Same random password for confirmation
+                )
+                user = crud.user.create(db, obj_in=user_in)
+                
+                # Create OAuth account
+                crud.oauth_account.create(
+                    db,
+                    user_id=user.id,
+                    provider=oauth_provider,
+                    provider_user_id=user_info.provider_user_id,
+                    access_token=token_data["access_token"],
+                    refresh_token=token_data.get("refresh_token"),
+                    expires_at=token_data["expires_at"]
+                )
+        
+        # Create access and refresh tokens
+        access_token = create_access_token(subject=user.id)
+        refresh_token = create_refresh_token(user_id=user.id)
+        
+        # Store tokens in the database
+        crud.token.create_access_token(db, user_id=user.id, token=access_token)
+        crud.token.create_refresh_token(db, user_id=user.id, token=refresh_token)
+        
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer"
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
 
 
 @router.get("/account-status/{email}", response_model=LoginAttemptStats)
@@ -666,27 +680,26 @@ def check_account_status(
         )
     
     # Get account statistics
-    recent_attempts = len(get_recent_attempts(db, email=email, minutes=settings.ACCOUNT_LOCKOUT_MINUTES))
+    recent_attempts = get_recent_attempts(db, email=email, minutes=settings.ACCOUNT_LOCKOUT_MINUTES)
     
-    recent_failed_attempts = crud.login_attempt.count_recent_failed_attempts(
+    recent_failed_attempts = count_recent_failed_attempts(
         db, email=email, minutes=settings.ACCOUNT_LOCKOUT_MINUTES
     )
     
-    is_locked = crud.login_attempt.is_account_locked(
+    is_locked = is_account_locked(
         db, email=email, max_attempts=settings.MAX_LOGIN_ATTEMPTS, lockout_minutes=settings.ACCOUNT_LOCKOUT_MINUTES
     )
     
     lockout_remaining = None
-    if is_locked:
+    if is_locked and recent_attempts:
         # Calculate remaining lockout time
-        most_recent_attempt = get_recent_attempts(db, email=email, minutes=settings.ACCOUNT_LOCKOUT_MINUTES)[0]
+        most_recent_attempt = recent_attempts[0]
         
-        from datetime import datetime
         elapsed_minutes = (datetime.utcnow() - most_recent_attempt.timestamp).total_seconds() / 60
         lockout_remaining = max(0, int(settings.ACCOUNT_LOCKOUT_MINUTES - elapsed_minutes))
     
     return {
-        "recent_attempts": recent_attempts,
+        "recent_attempts": len(recent_attempts),
         "recent_failed_attempts": recent_failed_attempts,
         "is_locked": is_locked,
         "lockout_remaining": lockout_remaining,
@@ -704,7 +717,7 @@ def unlock_account(
     Unlock a user account.
     """
     # Check if the user has admin privileges
-    if not current_user.is_admin:
+    if not current_user.is_superuser:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not enough privileges",

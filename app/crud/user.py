@@ -5,6 +5,10 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 from passlib.context import CryptContext
+import pyotp
+import qrcode
+import io
+import base64
 
 from app.core.security import get_password_hash, verify_password
 from app.models.user import User
@@ -36,7 +40,7 @@ def create(db: Session, *, obj_in: UserCreate) -> User:
         date_of_birth=obj_in.date_of_birth,
         gender=obj_in.gender,
         mobile=obj_in.mobile,
-        password_hash=get_password_hash(obj_in.password) if obj_in.password else None,
+        hashed_password=get_password_hash(obj_in.password) if obj_in.password else None,
         is_active=True,
         is_email_verified=obj_in.is_email_verified if hasattr(obj_in, 'is_email_verified') else False,
         mfa_enabled=False,
@@ -72,7 +76,7 @@ def update(
 
 def set_password(db: Session, *, user: User, password: str) -> User:
     """Set a new password for the user."""
-    user.password_hash = get_password_hash(password)
+    user.hashed_password = get_password_hash(password)
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -84,9 +88,9 @@ def authenticate(db: Session, *, email: str, password: str) -> Optional[User]:
     user = get_by_email(db, email=email)
     if not user:
         return None
-    if not user.password_hash:  # OAuth user without password
+    if not user.hashed_password:  # OAuth user without password
         return None
-    if not verify_password(password, user.password_hash):
+    if not verify_password(password, user.hashed_password):
         return None
     if not user.is_email_verified:
         return None
@@ -138,12 +142,47 @@ def update_last_login(db: Session, user: User) -> User:
 
 
 def enable_mfa(db: Session, user: User, enable: bool = True) -> User:
+    """Enable MFA for a user."""
+    if enable:
+        # Generate MFA secret
+        secret = pyotp.random_base32()
+        user.mfa_secret = secret
+
+        # Generate QR code
+        totp = pyotp.TOTP(secret)
+        provisioning_uri = totp.provisioning_uri(
+            user.email,
+            issuer_name="AuthenticationSystem"
+        )
+        qr = qrcode.QRCode(version=1, box_size=10, border=5)
+        qr.add_data(provisioning_uri)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        
+        # Convert QR code to base64
+        buffer = io.BytesIO()
+        img.save(buffer, format="PNG")
+        qr_code = base64.b64encode(buffer.getvalue()).decode()
+        user.mfa_qr_code = qr_code
+    else:
+        user.mfa_secret = None
+        user.mfa_qr_code = None
+    
     user.mfa_enabled = enable
     user.updated_at = datetime.utcnow()
     db.add(user)
     db.commit()
     db.refresh(user)
     return user
+
+
+def verify_mfa_code(db: Session, user: User, code: str) -> bool:
+    """Verify MFA code."""
+    if not user.mfa_enabled or not user.mfa_secret:
+        return False
+    
+    totp = pyotp.TOTP(user.mfa_secret)
+    return totp.verify(code)
 
 
 def create_verification_token(

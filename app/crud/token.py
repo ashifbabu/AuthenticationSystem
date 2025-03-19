@@ -5,14 +5,14 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 
-from app.models.token import AccessToken, RefreshToken, TokenType, VerificationToken, Token
+from app.models.token import AccessToken, RefreshToken, TokenType, VerificationToken, Token, OAuthStateToken
 from app.models.user import User
 from app.core.security import get_password_hash
 
 
 def create_verification_token(
     db: Session,
-    user_id: str,
+    user_id: Optional[str],
     token: str,
     token_type: TokenType,
     expires_delta: timedelta,
@@ -20,7 +20,15 @@ def create_verification_token(
     """Create a verification token."""
     expires_at = datetime.utcnow() + expires_delta
     
-    db_obj = VerificationToken(
+    # Use the correct token class based on token type
+    token_class = {
+        TokenType.EMAIL_VERIFICATION: VerificationToken,
+        TokenType.PASSWORD_RESET: VerificationToken,
+        TokenType.MFA: VerificationToken,
+        TokenType.OAUTH_STATE: OAuthStateToken,
+    }.get(token_type, Token)
+    
+    db_obj = token_class(
         user_id=user_id,
         token=token,  # We're not hashing verification tokens in this implementation
         token_type=token_type,
@@ -167,6 +175,19 @@ def delete_all_user_tokens(db: Session, user_id: UUID) -> None:
     """Delete all tokens for a user."""
     db.query(Token).filter(Token.user_id == user_id).delete()
     db.commit()
+
+
+def get_oauth_state_token(
+    db: Session,
+    token: str,
+) -> Optional[OAuthStateToken]:
+    """Get an OAuth state token by its value."""
+    return db.query(OAuthStateToken).filter(
+        OAuthStateToken.token == token,
+        OAuthStateToken.is_revoked == False,
+        OAuthStateToken.expires_at > datetime.utcnow(),
+        OAuthStateToken.token_type == TokenType.OAUTH_STATE
+    ).first()
 
 
     db.commit() 

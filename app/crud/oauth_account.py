@@ -1,99 +1,58 @@
-from typing import Optional
-from datetime import datetime
-from uuid import UUID
-
+from typing import List, Optional
+from uuid import uuid4
 from sqlalchemy.orm import Session
+from sqlalchemy import and_
 
-from app.models.oauth import OAuthAccount, OAuthProvider
-from app.models.user import User
+from app.crud.base import CRUDBase
+from app.models.oauth import OAuthAccount
+from app.schemas.oauth import OAuthAccountCreate, OAuthAccountUpdate
+from app.core.enums import OAuthProvider
 
+class CRUDOAuthAccount(CRUDBase[OAuthAccount, OAuthAccountCreate, OAuthAccountUpdate]):
+    def get_by_provider_and_account_id(
+        self, db: Session, *, provider: OAuthProvider, account_id: str
+    ) -> Optional[OAuthAccount]:
+        return db.query(OAuthAccount).filter(
+            and_(
+                OAuthAccount.provider == provider,
+                OAuthAccount.account_id == account_id
+            )
+        ).first()
 
-def get_by_provider_and_user(
-    db: Session, provider: OAuthProvider, provider_user_id: str
-) -> Optional[OAuthAccount]:
-    """Get an OAuth account by provider and provider user ID."""
-    return db.query(OAuthAccount).filter(
-        OAuthAccount.provider == provider,
-        OAuthAccount.provider_user_id == provider_user_id,
-    ).first()
+    def get_by_provider_and_user_id(
+        self, db: Session, *, provider: OAuthProvider, user_id: str
+    ) -> Optional[OAuthAccount]:
+        return db.query(OAuthAccount).filter(
+            and_(
+                OAuthAccount.provider == provider,
+                OAuthAccount.user_id == user_id
+            )
+        ).first()
 
+    def get_by_user_id(
+        self, db: Session, *, user_id: str
+    ) -> List[OAuthAccount]:
+        return db.query(OAuthAccount).filter(
+            OAuthAccount.user_id == user_id
+        ).all()
 
-def get_by_user_id_and_provider(
-    db: Session, user_id: UUID, provider: OAuthProvider
-) -> Optional[OAuthAccount]:
-    """Get an OAuth account by user ID and provider."""
-    return db.query(OAuthAccount).filter(
-        OAuthAccount.user_id == user_id,
-        OAuthAccount.provider == provider,
-    ).first()
-
-
-def create(
-    db: Session, 
-    user_id: UUID, 
-    provider: OAuthProvider, 
-    provider_user_id: str,
-    access_token: str,
-    refresh_token: Optional[str] = None,
-    expires_at: Optional[datetime] = None
-) -> OAuthAccount:
-    """Create a new OAuth account."""
-    db_obj = OAuthAccount(
-        user_id=user_id,
-        provider=provider,
-        provider_user_id=provider_user_id,
-        access_token=access_token,
-        refresh_token=refresh_token,
-        expires_at=expires_at
-    )
-    db.add(db_obj)
-    db.commit()
-    db.refresh(db_obj)
-    return db_obj
-
-
-def get_or_create(
-    db: Session, 
-    user_id: UUID, 
-    provider: OAuthProvider, 
-    provider_user_id: str,
-    access_token: str,
-    refresh_token: Optional[str] = None,
-    expires_at: Optional[datetime] = None
-) -> OAuthAccount:
-    """Get an existing OAuth account or create a new one."""
-    oauth_account = get_by_user_id_and_provider(db, user_id, provider)
-    
-    if oauth_account:
-        # Update token data if provided
-        if access_token:
-            oauth_account.access_token = access_token
-        if refresh_token:
-            oauth_account.refresh_token = refresh_token
-        if expires_at:
-            oauth_account.expires_at = expires_at
-            
-        # Check if the provider_user_id has changed
-        if oauth_account.provider_user_id != provider_user_id:
-            oauth_account.provider_user_id = provider_user_id
-            
-        db.add(oauth_account)
+    def create(
+        self, db: Session, *, obj_in: OAuthAccountCreate
+    ) -> OAuthAccount:
+        db_obj = OAuthAccount(
+            id=str(uuid4()),
+            provider=obj_in.provider,
+            account_id=obj_in.account_id,
+            account_email=obj_in.account_email,
+            user_id=obj_in.user_id,
+            access_token=obj_in.access_token,
+            refresh_token=obj_in.refresh_token,
+            expires_at=obj_in.expires_at,
+            is_active=obj_in.is_active
+        )
+        db.add(db_obj)
         db.commit()
-        db.refresh(oauth_account)
-        return oauth_account
-    
-    return create(
-        db, 
-        user_id, 
-        provider, 
-        provider_user_id,
-        access_token,
-        refresh_token,
-        expires_at
-    )
+        db.refresh(db_obj)
+        return db_obj
 
-
-def delete(db: Session, oauth_account_id: UUID) -> None:
-    """Delete an OAuth account."""
-    db.query(OAuthAccount).filter(OAuthAccount.id == oauth_account_id).delete()
-    db.commit() 
+oauth_crud = CRUDOAuthAccount(OAuthAccount) 

@@ -1,8 +1,8 @@
 from enum import Enum
-from typing import Dict, Optional
-from datetime import date
+from typing import Dict, Any, Optional
+from datetime import date, datetime
 
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, Field
 from app.core.enums import OAuthProvider
 
 
@@ -18,12 +18,41 @@ class OAuthCallback(BaseModel):
 
 
 class OAuthUserInfo(BaseModel):
+    """OAuth user information."""
     provider: OAuthProvider
-    provider_user_id: str
+    account_id: str
     email: str
     first_name: Optional[str] = None
     last_name: Optional[str] = None
-    picture_url: Optional[str] = None
-    gender: Optional[str] = None
-    date_of_birth: Optional[date] = None
-    raw_data: Optional[Dict] = None
+    raw_data: dict
+
+
+class OAuthAccountBase(BaseModel):
+    provider: OAuthProvider
+    account_id: str
+    account_email: str
+    access_token: str
+    refresh_token: Optional[str] = None
+    expires_at: Optional[datetime] = None
+    is_active: bool = True
+
+
+class OAuthAccountCreate(OAuthAccountBase):
+    user_id: str
+
+
+class OAuthAccountUpdate(BaseModel):
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    expires_at: Optional[datetime] = None
+    is_active: Optional[bool] = None
+
+
+class OAuthAccount(OAuthAccountBase):
+    id: str
+    user_id: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True

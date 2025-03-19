@@ -3,7 +3,7 @@ from datetime import date, datetime
 from enum import Enum
 from typing import List, Optional
 
-from sqlalchemy import Boolean, Column, Date, DateTime, Enum as SQLAlchemyEnum, String
+from sqlalchemy import Boolean, Column, Date, DateTime, Enum as SQLAlchemyEnum, Integer, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -30,9 +30,13 @@ class User(Base):
     gender = Column(SQLAlchemyEnum(Gender), nullable=True)
     email = Column(String, unique=True, index=True, nullable=False)
     mobile = Column(String, nullable=True)
-    password_hash = Column(String, nullable=True)
+    hashed_password = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
     is_email_verified = Column(Boolean, default=False)
+    is_locked = Column(Boolean, default=False)
+    recent_failed_attempts = Column(Integer, default=0)
+    mfa_secret = Column(String, nullable=True)
+    mfa_qr_code = Column(String, nullable=True)
     mfa_enabled = Column(Boolean, default=False)
     is_superuser = Column(Boolean, default=False)
     created_at = Column(DateTime, default=func.now())
@@ -44,4 +48,5 @@ class User(Base):
     oauth_accounts = relationship("OAuthAccount", back_populates="user", cascade="all, delete-orphan")
     access_tokens = relationship("AccessToken", back_populates="user", cascade="all, delete-orphan", overlaps="tokens")
     refresh_tokens = relationship("RefreshToken", back_populates="user", cascade="all, delete-orphan", overlaps="tokens")
-    verification_tokens = relationship("VerificationToken", back_populates="user", cascade="all, delete-orphan", overlaps="tokens") 
+    verification_tokens = relationship("VerificationToken", back_populates="user", cascade="all, delete-orphan", overlaps="tokens")
+    oauth_state_tokens = relationship("OAuthStateToken", back_populates="user", cascade="all, delete-orphan", overlaps="tokens") 
