@@ -8,9 +8,21 @@
     ],
     "rewrites": [
       {
-        "source": "**",
-        "destination": "/index.html"
+        "source": "/api/**",
+        "function": "fastapi_app"
+      },
+      {
+        "source": "/docs",
+        "function": "fastapi_app"
+      },
+      {
+        "source": "/redoc",
+        "function": "fastapi_app"
+      },
+      {
+        "source": "/openapi.json",
+        "function": "fastapi_app"
       }
     ]
   }
-} 
+}
